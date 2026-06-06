@@ -100,7 +100,7 @@
               <option value="BEGIN;&#10;-- statements…&#10;COMMIT;">Transaction</option>
               <option value="EXPLAIN ANALYZE SELECT * FROM table_name;">EXPLAIN ANALYZE</option>
             </select>
-            <label class="mlabel flex items-center gap-1.5">rows <input id="maxrows" type="number" value="500" min="1" max="5000" class="input w-20 py-1 text-xs font-mono"></label>
+            <label class="mlabel flex items-center gap-1.5">rows / page <input id="maxrows" type="number" value="100" min="1" max="5000" class="input w-20 py-1 text-xs font-mono"></label>
             <span class="flex-1"></span>
             <button class="btn btn-sm" id="histbtn" onclick="toggleHistory()"><span data-ic="history" data-s="13"></span>History</button>
             <button class="btn btn-primary" onclick="runQuery()"><span data-ic="play" data-s="13"></span>Run<kbd class="ml-1">⌃↵</kbd></button>
@@ -130,7 +130,7 @@
       <div class="flex items-center gap-3">
         <h2 class="font-display font-semibold italic text-[16px] tracking-tight flex items-center gap-2"><span data-ic="filecode" data-s="16" class="text-quill-400"></span><span id="tbl-title" class="font-mono">—</span></h2>
         <span class="flex-1"></span>
-        <button class="btn btn-sm" onclick="if(activeTable) selectTable(activeTable.schema, activeTable.name)"><span data-ic="play" data-s="12"></span>SELECT 500</button>
+        <button class="btn btn-sm" onclick="if(activeTable) selectTable(activeTable.schema, activeTable.name)"><span data-ic="play" data-s="12"></span>Browse rows</button>
         <button class="btn btn-sm" onclick="loadTableDef(true)"><span data-ic="refresh" data-s="12"></span>Refresh</button>
       </div>
       <div class="panel p-4">
@@ -489,7 +489,7 @@ async function loadTree(db) {
       const node = document.createElement("div");
       const label = (t.schema !== "public" ? t.schema + "." : "") + t.name;
       node.innerHTML = `
-        <div class="tnode flex items-center gap-1 px-1 py-[3px] rounded cursor-pointer hover:bg-paper-800 text-[12px]" title="Run SELECT * LIMIT 500">
+        <div class="tnode flex items-center gap-1 px-1 py-[3px] rounded cursor-pointer hover:bg-paper-800 text-[12px]" title="Browse rows (sortable, paginated)">
           <span class="chev text-ink-700 transition-transform duration-150" style="display:inline-flex">${ic("chevron", 11)}</span>
           <span class="${t.kind === "view" ? "text-blue-led" : "text-ink-500"}">${ic(t.kind === "view" ? "eye" : "table", 12)}</span>
           <span class="flex-1 truncate text-ink-300">${esc(label)}</span>
@@ -559,7 +559,7 @@ function dropDb(name) {
   });
 }
 
-/* ════════════════ table selection → SELECT 500 + DDL tab ════════════════ */
+/* ════════════════ table selection → browse + DDL tab ════════════════ */
 function fqtn(schema, name) { return (schema === "public" ? "" : '"' + schema + '".') + '"' + name + '"'; }
 function selectTable(schema, name) {
   activeTable = { schema, name };
@@ -572,11 +572,11 @@ function selectTable(schema, name) {
   const meta = lookupTableMeta(schema, name);
   if (meta) {
     // PK known → browse mode: sortable headers + keyset pagination
-    browse = { schema, table: name, pk: meta.pk, types: meta.types, sort: null, pages: [null], page: 0, limit: 500 };
+    browse = { schema, table: name, pk: meta.pk, types: meta.types, sort: null, pages: [null], page: 0, limit: 100 };
     browseRun();
   } else {
     browse = null;
-    setEditorSql(`SELECT * FROM ${fqtn(schema, name)} LIMIT 500;`);
+    setEditorSql(`SELECT * FROM ${fqtn(schema, name)} LIMIT 100;`);
     runQuery(true);
   }
 }
@@ -689,7 +689,9 @@ function compileBrowse() {
   return `SELECT * FROM ${browseFq()}\n${where ? where + "\n" : ""}ORDER BY ${order}\nLIMIT ${browse.limit};`;
 }
 function browseRun() {
-  browse.limit = Number(document.getElementById("maxrows").value) || 500;
+  const lim = Number(document.getElementById("maxrows").value) || 100;
+  if (lim !== browse.limit && browse.page > 0) { browse.pages = [null]; browse.page = 0; } // page size changed → cursors stale, restart at row 1
+  browse.limit = lim;
   setEditorSql(compileBrowse());
   runQuery(true, lookupTableMeta(browse.schema, browse.table));
 }
@@ -728,7 +730,7 @@ async function runQuery(skipConfirm = false, editableOverride = null) {
   try {
     const { results } = await api("/api/query", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ db: currentDb, sql, maxRows: Number(document.getElementById("maxrows").value) || 500 }),
+      body: JSON.stringify({ db: currentDb, sql, maxRows: Number(document.getElementById("maxrows").value) || 100 }),
     });
     const wall = Math.round(performance.now() - t0);
     const dbMs = results.reduce((a, r) => a + (r.ms || 0), 0);
@@ -754,12 +756,19 @@ async function runQuery(skipConfirm = false, editableOverride = null) {
           <div class="px-3 py-2.5 text-red-led font-mono text-xs">${esc(r.error)}</div>`;
       } else if (r.rows.length) {
         const sortable = browse && lastRun.editable && si === 0;
-        const pager = sortable ? `
+        let pager = "";
+        if (sortable) {
+          // row-range pager: each Next compiles the keyset query for the following window
+          const start = browse.page * browse.limit + 1;
+          const end = start + r.rows.length - 1;
+          const atEnd = r.rows.length < browse.limit;
+          pager = `
             <span class="flex items-center gap-1.5 mx-1">
-              <button class="btn btn-sm" data-pg="prev" ${browse.page === 0 ? 'disabled style="opacity:.4"' : ""}>◂ Prev</button>
-              <span class="mlabel">page ${browse.page + 1}</span>
-              <button class="btn btn-sm" data-pg="next" ${r.rows.length < browse.limit ? 'disabled style="opacity:.4"' : ""}>Next ▸</button>
-            </span>` : "";
+              <button class="btn btn-sm" data-pg="prev" title="rows ${Math.max(1, start - browse.limit)}–${start - 1}" ${browse.page === 0 ? 'disabled style="opacity:.4"' : ""}>◂ ${start - browse.limit > 0 ? `${start - browse.limit}–${start - 1}` : "Prev"}</button>
+              <span class="chip chip-quill">rows ${start}–${end}${atEnd ? " · end" : ""}</span>
+              <button class="btn btn-sm" data-pg="next" title="rows ${end + 1}–${end + browse.limit}" ${atEnd ? 'disabled style="opacity:.4"' : ""}>${end + 1}–${end + browse.limit} ▸</button>
+            </span>`;
+        }
         block.innerHTML = `
           <div class="flex items-center gap-3 px-3 py-1.5 bg-paper-800 font-mono text-[11px] flex-wrap">
             <span class="text-quill-400 font-semibold">${esc(r.command || "OK")}</span>
