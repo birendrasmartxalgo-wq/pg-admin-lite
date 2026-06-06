@@ -575,17 +575,41 @@ Bun.serve({
     const url = new URL(req.url);
     if (url.pathname.startsWith("/api/")) {
       try {
-        return await handleApi(req, url);
+        const res = await handleApi(req, url);
+        // gzip JSON payloads >1 KB — big result sets shrink ~5-10x, which is most
+        // of the browser-observed "wall" time on remote links (server time is ~1ms)
+        if (res.headers.get("content-type")?.includes("application/json") &&
+            !res.headers.get("content-encoding") &&
+            /\bgzip\b/.test(req.headers.get("accept-encoding") || "")) {
+          const buf = await res.arrayBuffer();
+          if (buf.byteLength > 1024) {
+            return new Response(Bun.gzipSync(new Uint8Array(buf), { level: 4 }), {
+              status: res.status,
+              headers: { "content-type": "application/json", "content-encoding": "gzip", "vary": "accept-encoding" },
+            });
+          }
+          return new Response(buf, { status: res.status, headers: { "content-type": "application/json" } });
+        }
+        return res;
       } catch (e) {
         return err(e?.message || String(e), 500);
       }
     }
+    const gzipOk = /\bgzip\b/.test(req.headers.get("accept-encoding") || "");
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      return new Response(Bun.file(import.meta.dir + "/public/index.html"));
+      const f = Bun.file(import.meta.dir + "/public/index.html");
+      if (gzipOk) return new Response(Bun.gzipSync(new Uint8Array(await f.arrayBuffer()), { level: 4 }),
+        { headers: { "content-type": "text/html;charset=utf-8", "content-encoding": "gzip", "vary": "accept-encoding" } });
+      return new Response(f);
     }
     if (url.pathname.startsWith("/assets/") && !url.pathname.includes("..")) {
       const f = Bun.file(import.meta.dir + "/public" + url.pathname);
       if (await f.exists()) {
+        // gzip text assets (css); fonts are already compressed
+        if (gzipOk && url.pathname.endsWith(".css")) {
+          return new Response(Bun.gzipSync(new Uint8Array(await f.arrayBuffer()), { level: 4 }),
+            { headers: { "content-type": "text/css", "content-encoding": "gzip", "vary": "accept-encoding", "cache-control": "public, max-age=86400" } });
+        }
         return new Response(f, { headers: { "cache-control": "public, max-age=86400" } });
       }
     }
