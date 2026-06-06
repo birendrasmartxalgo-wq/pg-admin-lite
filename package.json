@@ -1,0 +1,11 @@
+{
+  "name": "pg-admin-lite",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "start": "bun server.js",
+    "dev": "bun --watch server.js",
+    "css": "./tools/tailwindcss -i src/input.css -o public/assets/tw.css --minify",
+    "css:watch": "./tools/tailwindcss -i src/input.css -o public/assets/tw.css --watch"
+  }
+}

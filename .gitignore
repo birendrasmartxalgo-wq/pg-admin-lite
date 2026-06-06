@@ -1,0 +1,8 @@
+# secrets — PG superuser creds + ADMIN_PASSWORD
+.env
+
+# 117MB tailwind standalone binary — fetch per-arch, don't version it
+tools/tailwindcss
+
+node_modules/
+*.log
