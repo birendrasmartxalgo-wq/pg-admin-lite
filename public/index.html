@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pg-admin-lite · the ledger</title>
-<link rel="stylesheet" href="/assets/tw.css?v=ledger2">
+<script>if (localStorage.getItem("pgal_dark") === "1") document.documentElement.classList.add("dark");</script>
+<link rel="stylesheet" href="/assets/tw.css?v=ledger3">
 <style>
   /* tiny bits that are easier inline than as utilities */
   #sqlbox { tab-size: 2; }
@@ -42,6 +43,7 @@
   <span class="flex-1"></span>
   <span class="chip" id="latency"><span class="led led-amber"></span><span>linking…</span></span>
   <span class="chip chip-quill" id="curdbchip"><span data-ic="database" data-s="11"></span><b id="curdb">—</b></span>
+  <button class="btn btn-sm btn-icon" title="Toggle day / night ledger" onclick="toggleDark()"><span id="darkic"></span></button>
   <button class="btn btn-sm btn-icon" title="Logout" onclick="logout()"><span data-ic="logout" data-s="14"></span></button>
 </header>
 
@@ -225,6 +227,14 @@
 </div>
 <div id="toast" class="fixed bottom-4 right-4 flex flex-col gap-2 z-[60]"></div>
 
+<!-- ════════════════ PENDING-EDITS SAVE BAR ════════════════ -->
+<div id="savebar" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 z-[65] panel !bg-paper-850 pl-4 pr-2.5 py-2 items-center gap-3 shadow-[0_12px_36px_-8px_rgba(34,28,16,0.5)]">
+  <span class="led led-amber"></span>
+  <span class="font-mono text-[11px]" id="savecount"></span>
+  <button class="btn btn-sm btn-primary" onclick="savePending()"><span data-ic="play" data-s="12"></span>Save · 1 transaction</button>
+  <button class="btn btn-sm" onclick="discardPending()">Discard</button>
+</div>
+
 <!-- ════════════════ MODAL ════════════════ -->
 <div id="modal" class="fixed inset-0 z-[70] hidden items-center justify-center bg-ink-100/35 p-6">
   <div id="modalcard" class="notch panel !bg-paper-850 w-full max-w-[620px] max-h-[85vh] flex flex-col reveal shadow-[0_24px_60px_-12px_rgba(34,28,16,0.5)]"></div>
@@ -259,6 +269,8 @@ const I = {
   keyround: '<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>',
   arrowright: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
   layers: '<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>',
+  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
 };
 const ic = (n, s = 14, cls = "") =>
   `<svg class="${cls}" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:none">${I[n] || ""}</svg>`;
@@ -266,6 +278,17 @@ function hydrateIcons(root = document) {
   root.querySelectorAll("[data-ic]").forEach(e => { e.innerHTML = ic(e.dataset.ic, Number(e.dataset.s || 14)); });
 }
 hydrateIcons();
+
+/* ════════════════ day / night ledger ════════════════ */
+function renderDarkIc() {
+  document.getElementById("darkic").innerHTML = ic(document.documentElement.classList.contains("dark") ? "sun" : "moon", 14);
+}
+function toggleDark() {
+  const dark = document.documentElement.classList.toggle("dark");
+  localStorage.setItem("pgal_dark", dark ? "1" : "0");
+  renderDarkIc();
+}
+renderDarkIc();
 
 /* ════════════════ state & helpers ════════════════ */
 let token = localStorage.getItem("pgal_token") || "";
@@ -371,7 +394,8 @@ function confirmDanger(warns, sql) {
   });
 }
 
-/* SQL literal builder for generated UPDATEs */
+const qid = s => '"' + String(s).replace(/"/g, '""') + '"';
+/* SQL literal builder for generated UPDATEs / INSERT exports */
 function sqlLit(v, type = "") {
   if (v === null || v === undefined) return "NULL";
   const t = type.toLowerCase();
@@ -438,6 +462,7 @@ async function loadDatabases() {
   if (currentDb && dbs.some(d => d.name === currentDb)) selectDb(currentDb, true);
 }
 async function selectDb(name) {
+  if (currentDb !== name) browse = null; // cursors are per-table, per-db
   currentDb = name;
   localStorage.setItem("pgal_db", name);
   document.getElementById("curdb").textContent = name;
@@ -543,9 +568,17 @@ function selectTable(schema, name) {
   document.getElementById("tabbtn-table-label").textContent = name;
   document.getElementById("tbl-title").textContent = (schema === "public" ? "" : schema + ".") + name;
   tableDefLoadedFor = null;
-  setEditorSql(`SELECT * FROM ${fqtn(schema, name)} LIMIT 500;`);
   showTab("query");
-  runQuery();
+  const meta = lookupTableMeta(schema, name);
+  if (meta) {
+    // PK known → browse mode: sortable headers + keyset pagination
+    browse = { schema, table: name, pk: meta.pk, types: meta.types, sort: null, pages: [null], page: 0, limit: 500 };
+    browseRun();
+  } else {
+    browse = null;
+    setEditorSql(`SELECT * FROM ${fqtn(schema, name)} LIMIT 500;`);
+    runQuery(true);
+  }
 }
 
 /* ════════════════ DDL & indexes inspector ════════════════ */
@@ -610,11 +643,8 @@ function insertSnippet() {
   sel.value = "";
   box.focus();
 }
-/* if the run is a plain single-table SELECT * and we know its PK, results are editable */
-function detectEditable(sql) {
-  const m = sql.trim().match(/^select\s+\*\s+from\s+(?:"([^"]+)"\.)?"?([\w]+)"?\s*(?:limit\s+\d+)?\s*;?\s*$/i);
-  if (!m) return null;
-  const schema = m[1] || "public", table = m[2];
+/* PK + column types for a table, from the schema cache */
+function lookupTableMeta(schema, table) {
   const cache = schemaCache[currentDb];
   if (!cache) return null;
   const pk = (cache.pks.find(p => p.schema === schema && p.table === table) || {}).cols || [];
@@ -622,9 +652,64 @@ function detectEditable(sql) {
   const cols = cache.columns.filter(c => c.schema === schema && c.table === table);
   return { schema, table, pk, types: Object.fromEntries(cols.map(c => [c.name, c.type])) };
 }
+/* if the run is a plain single-table SELECT * and we know its PK, results are editable */
+function detectEditable(sql) {
+  const m = sql.trim().match(/^select\s+\*\s+from\s+(?:"([^"]+)"\.)?"?([\w]+)"?\s*(?:limit\s+\d+)?\s*;?\s*$/i);
+  return m ? lookupTableMeta(m[1] || "public", m[2]) : null;
+}
 let lastRun = null; // { sql, results, editable }
 
-async function runQuery(skipConfirm = false) {
+/* ════════════════ table browse: sort + keyset (cursor) pagination ════════════════
+   Interactions compile to SQL — the grid never sorts the DOM. "Next" anchors on the
+   last row of the page: WHERE (sort_col, pk…) > (cursor values), never OFFSET. */
+let browse = null; // { schema, table, pk, types, sort:{col,dir}|null, pages:[cursorRow|null], page, limit }
+function browseFq() { return (browse.schema === "public" ? "" : qid(browse.schema) + ".") + qid(browse.table); }
+function compileBrowse() {
+  const s = browse.sort;
+  const dir = s ? s.dir : "ASC";
+  const op = dir === "ASC" ? ">" : "<";
+  const orderCols = s ? [s.col, ...browse.pk.filter(k => k !== s.col)] : [...browse.pk];
+  const order = orderCols.map(c => `${qid(c)} ${dir}${s && c === s.col ? " NULLS LAST" : ""}`).join(", ");
+  let where = "";
+  const cur = browse.pages[browse.page]; // last row of the previous page, or null on page 1
+  if (cur) {
+    const pkTuple = browse.pk.length === 1 ? qid(browse.pk[0]) : `(${browse.pk.map(qid).join(", ")})`;
+    const pkVals = browse.pk.length === 1 ? sqlLit(cur[browse.pk[0]], browse.types[browse.pk[0]] || "")
+      : `(${browse.pk.map(k => sqlLit(cur[k], browse.types[k] || "")).join(", ")})`;
+    if (!s) where = `WHERE ${pkTuple} ${op} ${pkVals}`;
+    else {
+      const c = qid(s.col), v = cur[s.col];
+      if (v === null || v === undefined) where = `WHERE ${c} IS NULL AND ${pkTuple} ${op} ${pkVals}`;
+      else {
+        const lit = sqlLit(v, browse.types[s.col] || "");
+        where = `WHERE (${c} ${op} ${lit} OR (${c} = ${lit} AND ${pkTuple} ${op} ${pkVals}) OR ${c} IS NULL)`;
+      }
+    }
+  }
+  return `SELECT * FROM ${browseFq()}\n${where ? where + "\n" : ""}ORDER BY ${order}\nLIMIT ${browse.limit};`;
+}
+function browseRun() {
+  browse.limit = Number(document.getElementById("maxrows").value) || 500;
+  setEditorSql(compileBrowse());
+  runQuery(true, lookupTableMeta(browse.schema, browse.table));
+}
+function browseSort(col) {
+  if (!browse) return;
+  browse.sort = !browse.sort || browse.sort.col !== col ? { col, dir: "ASC" }
+    : browse.sort.dir === "ASC" ? { col, dir: "DESC" } : null;
+  browse.pages = [null]; browse.page = 0;
+  browseRun();
+}
+function browseNext() {
+  const r = lastRun?.results[0];
+  if (!browse || !r?.rows.length) return;
+  browse.pages[browse.page + 1] = r.rows[r.rows.length - 1];
+  browse.page++;
+  browseRun();
+}
+function browsePrev() { if (browse && browse.page > 0) { browse.page--; browseRun(); } }
+
+async function runQuery(skipConfirm = false, editableOverride = null) {
   if (!currentDb) return toast("Select a database in the sidebar first", true);
   const sql = document.getElementById("sqlbox").value.trim();
   if (!sql) return;
@@ -633,6 +718,8 @@ async function runQuery(skipConfirm = false) {
     const warns = classifyDanger(sql);
     if (warns.length && !(await confirmDanger(warns, sql))) return;
   }
+  if (!editableOverride) browse = null; // hand-run SQL leaves browse mode
+  pending.clear(); renderSaveBar();
   const out = document.getElementById("results");
   const sumEl = document.getElementById("runsummary");
   sumEl.innerHTML = `<span class="chip"><span class="led led-amber"></span>running on ${esc(currentDb)}…</span>`;
@@ -653,7 +740,7 @@ async function runQuery(skipConfirm = false) {
       <span class="chip">${ic("clock", 10)} wall ${wall} ms</span>
       <span class="chip">${totalRows} rows</span>`;
     recordHistory({ db: currentDb, sql, ms: dbMs, ok: okAll, rows: totalRows, at: Date.now() });
-    lastRun = { sql, results, editable: results.length === 1 && results[0].ok ? detectEditable(sql) : null };
+    lastRun = { sql, results, editable: results.length === 1 && results[0].ok ? (editableOverride || detectEditable(sql)) : null };
     out.innerHTML = "";
     results.forEach((r, si) => {
       const block = document.createElement("div");
@@ -666,13 +753,28 @@ async function runQuery(skipConfirm = false) {
           </div>
           <div class="px-3 py-2.5 text-red-led font-mono text-xs">${esc(r.error)}</div>`;
       } else if (r.rows.length) {
+        const sortable = browse && lastRun.editable && si === 0;
+        const pager = sortable ? `
+            <span class="flex items-center gap-1.5 mx-1">
+              <button class="btn btn-sm" data-pg="prev" ${browse.page === 0 ? 'disabled style="opacity:.4"' : ""}>◂ Prev</button>
+              <span class="mlabel">page ${browse.page + 1}</span>
+              <button class="btn btn-sm" data-pg="next" ${r.rows.length < browse.limit ? 'disabled style="opacity:.4"' : ""}>Next ▸</button>
+            </span>` : "";
         block.innerHTML = `
-          <div class="flex items-center gap-3 px-3 py-2 bg-paper-800 font-mono text-[11px]">
+          <div class="flex items-center gap-3 px-3 py-1.5 bg-paper-800 font-mono text-[11px] flex-wrap">
             <span class="text-quill-400 font-semibold">${esc(r.command || "OK")}</span>
             <span class="text-ink-500">${r.rowCount} row${r.rowCount === 1 ? "" : "s"}${r.truncated ? ` · <span class="text-amber-led">first ${r.rows.length} shown</span>` : ""}</span>
-            <span class="ml-auto text-ink-700">${r.ms} ms</span>
+            ${sortable && browse.sort ? `<span class="chip chip-quill">${esc(browse.sort.col)} ${browse.sort.dir === "ASC" ? "▲" : "▼"}</span>` : ""}
+            <span class="ml-auto flex items-center gap-1.5">
+              ${pager}
+              <button class="btn btn-sm" data-exp="sql" data-si="${si}" title="Download as INSERT statements">${ic("download", 11)}sql</button>
+              <button class="btn btn-sm" data-exp="json" data-si="${si}" title="Download rows as JSON">${ic("download", 11)}json</button>
+              <span class="text-ink-700">${r.ms} ms</span>
+            </span>
           </div>
-          <div class="gridscroll max-h-[360px]"><table class="grid-table"><thead><tr>${r.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead>
+          <div class="gridscroll max-h-[360px]"><table class="grid-table"><thead><tr>${r.columns.map(c => sortable
+            ? `<th class="thsort" data-col="${esc(c)}" title="Sort by ${esc(c)}">${esc(c)}${browse.sort?.col === c ? (browse.sort.dir === "ASC" ? " ▲" : " ▼") : ""}</th>`
+            : `<th>${esc(c)}</th>`).join("")}</tr></thead>
           <tbody>${r.rows.map((row, ri) => `<tr>${r.columns.map(c => {
             const v = row[c];
             const text = v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
@@ -697,11 +799,144 @@ async function runQuery(skipConfirm = false) {
   }
 }
 
-/* ════════════════ cell inspector / editor ════════════════ */
+/* ════════════════ cell inspector / inline editor / export ════════════════ */
+let cellClickTimer = null;
 document.getElementById("results").addEventListener("click", e => {
+  const pg = e.target.closest("[data-pg]");
+  if (pg) { if (!pg.disabled) pg.dataset.pg === "next" ? browseNext() : browsePrev(); return; }
+  const ex = e.target.closest("[data-exp]");
+  if (ex) return exportResult(Number(ex.dataset.si), ex.dataset.exp);
+  const th = e.target.closest("th.thsort");
+  if (th) return browseSort(th.dataset.col);
   const td = e.target.closest("td.cellv");
-  if (td) openCellModal(Number(td.dataset.si), Number(td.dataset.ri), td.dataset.c);
+  if (!td || td.querySelector("input")) return;
+  const open = () => openCellModal(Number(td.dataset.si), Number(td.dataset.ri), td.dataset.c);
+  if (lastRun?.editable) { // wait: a double-click means inline edit, not the inspector
+    clearTimeout(cellClickTimer);
+    cellClickTimer = setTimeout(open, 260);
+  } else open();
 });
+document.getElementById("results").addEventListener("dblclick", e => {
+  const td = e.target.closest("td.cellv");
+  if (!td || !lastRun?.editable || td.querySelector("input")) return;
+  clearTimeout(cellClickTimer);
+  startInlineEdit(td);
+});
+
+/* inline editing — edits accumulate as "pending", saved as one transaction */
+const pending = new Map(); // "ri:col" -> {ri, col, text}
+const cellText = v => v === null || v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+function startInlineEdit(td) {
+  const si = Number(td.dataset.si), ri = Number(td.dataset.ri), col = td.dataset.c;
+  const ed = lastRun.editable;
+  if (ed.pk.includes(col)) return toast("Primary-key cells anchor the UPDATE — not editable", true);
+  const orig = lastRun.results[si].rows[ri][col];
+  const prev = pending.get(ri + ":" + col);
+  td.innerHTML = `<input class="cellinput" spellcheck="false">`;
+  const inp = td.querySelector("input");
+  inp.value = prev ? prev.text : cellText(orig);
+  inp.focus(); inp.select();
+  let done = false;
+  const finish = commit => {
+    if (done) return; done = true;
+    if (commit) {
+      if (inp.value !== cellText(orig)) pending.set(ri + ":" + col, { ri, col, text: inp.value });
+      else pending.delete(ri + ":" + col);
+    }
+    paintCell(td, si, ri, col);
+    renderSaveBar();
+  };
+  inp.addEventListener("keydown", ev => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+    else if (ev.key === "Escape") { ev.stopPropagation(); finish(false); }
+  });
+  inp.addEventListener("blur", () => finish(true));
+}
+function paintCell(td, si, ri, col) {
+  const p = pending.get(ri + ":" + col);
+  if (p) {
+    td.classList.add("pendingcell");
+    td.textContent = p.text === "" ? "''" : p.text;
+    td.title = "pending: " + p.text;
+  } else {
+    td.classList.remove("pendingcell");
+    const orig = lastRun.results[si].rows[ri][col];
+    if (orig === null) { td.innerHTML = '<span class="text-ink-700">∅</span>'; td.title = ""; }
+    else { td.textContent = cellText(orig); td.title = cellText(orig).slice(0, 400); }
+  }
+}
+function renderSaveBar() {
+  const bar = document.getElementById("savebar");
+  bar.style.display = pending.size ? "flex" : "none";
+  if (pending.size) {
+    const rows = new Set([...pending.values()].map(p => p.ri)).size;
+    document.getElementById("savecount").textContent = `${pending.size} pending edit${pending.size > 1 ? "s" : ""} · ${rows} row${rows > 1 ? "s" : ""}`;
+  }
+}
+function discardPending() {
+  pending.clear();
+  document.querySelectorAll("#results td.pendingcell").forEach(td => paintCell(td, Number(td.dataset.si), Number(td.dataset.ri), td.dataset.c));
+  renderSaveBar();
+}
+async function savePending() {
+  if (!pending.size || !lastRun?.editable) return;
+  const ed = lastRun.editable;
+  const fq = (ed.schema === "public" ? "" : qid(ed.schema) + ".") + qid(ed.table);
+  const byRow = {};
+  for (const p of pending.values()) (byRow[p.ri] ||= []).push(p);
+  const stmts = Object.entries(byRow).map(([ri, cols]) => {
+    const row = lastRun.results[0].rows[ri];
+    const sets = cols.map(p => `${qid(p.col)} = ${textToLit(p.text, ed.types[p.col] || "")}`).join(", ");
+    const where = ed.pk.map(k => `${qid(k)} = ${sqlLit(row[k], ed.types[k] || "")}`).join(" AND ");
+    return `UPDATE ${fq} SET ${sets} WHERE ${where};`;
+  });
+  const sql = ["BEGIN;", ...stmts, "COMMIT;"].join("\n");
+  if (!(await confirmDanger(classifyDanger(sql), sql))) return;
+  try {
+    const { results } = await api("/api/query", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ db: currentDb, sql }) });
+    const bad = results.find(x => !x.ok);
+    if (bad) return toast(bad.error, true); // server already rolled back
+    toast(`Posted ${pending.size} edit${pending.size > 1 ? "s" : ""} across ${stmts.length} row${stmts.length > 1 ? "s" : ""}`);
+    pending.clear(); renderSaveBar();
+    refreshCurrent();
+  } catch (e) { toast(e.message, true); }
+}
+function textToLit(text, type) {
+  if (/json/.test(type.toLowerCase())) { try { return sqlLit(JSON.parse(text), type); } catch { /* treat as text */ } }
+  return sqlLit(text, type);
+}
+/* re-run whatever produced the current grid */
+function refreshCurrent() {
+  if (browse) browseRun();
+  else if (lastRun) { setEditorSql(lastRun.sql); runQuery(true, lastRun.editable); }
+}
+
+/* export the rows of one result as .sql INSERTs or .json */
+function exportResult(si, fmt) {
+  const r = lastRun?.results[si];
+  if (!r?.rows.length) return;
+  const rawName = lastRun.editable ? (lastRun.editable.schema === "public" ? "" : lastRun.editable.schema + ".") + lastRun.editable.table
+    : (r.statement.match(/from\s+([\w".]+)/i)?.[1] || "table_name").replace(/"/g, "");
+  let content, mime, ext;
+  if (fmt === "json") {
+    content = JSON.stringify(r.rows, null, 2);
+    mime = "application/json"; ext = "json";
+  } else {
+    const types = lastRun.editable?.types || {};
+    const fq = rawName.split(".").map(qid).join(".");
+    const colList = r.columns.map(qid).join(", ");
+    content = r.rows.map(row =>
+      `INSERT INTO ${fq} (${colList}) VALUES (${r.columns.map(c => sqlLit(row[c], types[c] || "")).join(", ")});`
+    ).join("\n") + "\n";
+    mime = "application/sql"; ext = "sql";
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([content], { type: mime }));
+  a.download = `${currentDb}-${rawName.replace(/\./g, "_")}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.${ext}`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast(`Exported ${r.rows.length} row${r.rows.length > 1 ? "s" : ""} as .${ext}${r.truncated ? " (fetched rows only)" : ""}`);
+}
 function openCellModal(si, ri, col) {
   if (!lastRun) return;
   const r = lastRun.results[si]; if (!r || !r.ok) return;
@@ -765,9 +1000,8 @@ function openCellModal(si, ri, col) {
         const { results } = await api("/api/query", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ db: currentDb, sql: upd }) });
         if (!results[0].ok) return toast(results[0].error, true);
         toast(`Updated ${results[0].rowCount} row${results[0].rowCount === 1 ? "" : "s"}`);
-        const sameSql = document.getElementById("sqlbox").value.trim().replace(/;+$/, "") === lastRun.sql.trim().replace(/;+$/, "");
         closeModal();
-        if (sameSql) runQuery(true);
+        refreshCurrent();
       } catch (e2) { toast(e2.message, true); }
     });
   }

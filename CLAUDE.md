@@ -1,6 +1,6 @@
 # pg-admin-lite
 
-Minimal pgAdmin4-style web console for the local PostgreSQL (port **4601**, systemd unit `pg-admin-lite.service`, logs `/var/log/pg-admin-lite.log`). Bun built-ins only — `Bun.serve`, `Bun.SQL`, `Bun.spawn` — no npm deps. "The Ledger" design (light parchment/ink-blue/red-margin, accountant's-ledger aesthetic): Tailwind 4.3 **standalone binary** (`tools/tailwindcss`, ARM64, no npm) + self-hosted fonts (Fraunces display serif, Libre Franklin UI, Space Mono data/SQL) + inline Lucide SVG icons — zero runtime CDN.
+Minimal pgAdmin4-style web console for the local PostgreSQL (port **4601**, systemd unit `pg-admin-lite.service`, logs `/var/log/pg-admin-lite.log`). Bun built-ins only — `Bun.serve`, `Bun.SQL`, `Bun.spawn` — no npm deps. "The Ledger" design (light parchment/ink-blue/red-margin, accountant's-ledger aesthetic; dark "night ledger" variant via token overrides under `html.dark`, persisted as `pgal_dark` in localStorage): Tailwind 4.3 **standalone binary** (`tools/tailwindcss`, ARM64, no npm) + self-hosted fonts (Fraunces display serif, Libre Franklin UI, Space Mono data/SQL) + inline Lucide SVG icons — zero runtime CDN.
 
 ## Layout
 

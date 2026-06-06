@@ -49,6 +49,34 @@
   --color-blue-led: #35539e;
 }
 
+/* ── night ledger — same bindings, darker leather ─────────────────────────
+   Every component reads tokens via var(), so overriding them under html.dark
+   flips the whole console. Toggle persisted in localStorage (pgal_dark). */
+.dark {
+  --color-paper-950: #141109;
+  --color-paper-900: #1b1810;
+  --color-paper-850: #211d13;
+  --color-paper-800: #2a2517;
+  --color-paper-700: #36301d;
+  --color-paper-600: #443c24;
+  --color-rule-700: #322c1c;
+  --color-rule-500: #4a4228;
+  --color-rule-300: #6f6443;
+  --color-ink-100: #ede4ca;
+  --color-ink-300: #c8bd9e;
+  --color-ink-500: #8f8465;
+  --color-ink-700: #5f573e;
+  --color-quill-300: #b3c7ec;
+  --color-quill-400: #94ace0;
+  --color-quill-500: #7b97d4;
+  --color-quill-600: #5878bb;
+  --color-amber-led: #d9a440;
+  --color-red-led: #d96a55;
+  --color-green-led: #6cb578;
+  --color-blue-led: #7b97d4;
+}
+.dark body::after { mix-blend-mode: screen; opacity: 0.03; }
+
 @layer base {
   ::selection { background: color-mix(in oklab, var(--color-quill-500) 22%, transparent); }
   * { scrollbar-width: thin; scrollbar-color: var(--color-rule-500) transparent; }
@@ -172,6 +200,17 @@
   /* clickable cells — inspector/editor popup */
   .grid-table td.cellv { cursor: pointer; }
   .grid-table td.cellv:hover { background: color-mix(in oklab, var(--color-quill-500) 13%, transparent); }
+  /* sortable headers (table-browse mode) */
+  .grid-table th.thsort { cursor: pointer; user-select: none; }
+  .grid-table th.thsort:hover { color: var(--color-quill-400); }
+  /* uncommitted inline edits — amber ink until the transaction is posted */
+  .grid-table td.pendingcell { background: color-mix(in oklab, var(--color-amber-led) 16%, transparent) !important; box-shadow: inset 2px 0 0 var(--color-amber-led); color: var(--color-ink-100); }
+  .cellinput {
+    width: 100%; min-width: 90px; font: inherit; color: var(--color-ink-100);
+    background: var(--color-paper-900); border: 1px solid var(--color-quill-500);
+    border-radius: 2px; padding: 1px 5px; outline: none;
+    box-shadow: 0 0 0 2.5px color-mix(in oklab, var(--color-quill-500) 16%, transparent);
+  }
 
   /* every wide grid scrolls inside its own wrapper, with a scrollbar you can actually see */
   .gridscroll { overflow: auto; overscroll-behavior: contain; max-width: 100%; scrollbar-width: thin; scrollbar-color: var(--color-rule-300) var(--color-paper-800); }
