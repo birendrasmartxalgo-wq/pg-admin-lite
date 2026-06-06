@@ -169,6 +169,15 @@
     max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .grid-table tbody tr:hover td { background: color-mix(in oklab, var(--color-quill-500) 6%, transparent); }
+  /* clickable cells — inspector/editor popup */
+  .grid-table td.cellv { cursor: pointer; }
+  .grid-table td.cellv:hover { background: color-mix(in oklab, var(--color-quill-500) 13%, transparent); }
+
+  /* every wide grid scrolls inside its own wrapper, with a scrollbar you can actually see */
+  .gridscroll { overflow: auto; overscroll-behavior: contain; max-width: 100%; scrollbar-width: thin; scrollbar-color: var(--color-rule-300) var(--color-paper-800); }
+  .gridscroll::-webkit-scrollbar { width: 10px; height: 10px; }
+  .gridscroll::-webkit-scrollbar-thumb { background: var(--color-rule-300); border-radius: 5px; border: 2px solid var(--color-paper-850); }
+  .gridscroll::-webkit-scrollbar-track { background: var(--color-paper-800); }
 
   /* rubber-stamp chips — rectangular, inked */
   .chip {
@@ -233,5 +242,6 @@
   /* autocomplete dropdown */
   .ac-item { display: flex; align-items: center; gap: 8px; padding: 5px 10px; font-family: var(--font-mono); font-size: 11.5px; color: var(--color-ink-300); cursor: pointer; }
   .ac-item.sel { background: color-mix(in oklab, var(--color-quill-500) 14%, transparent); color: var(--color-quill-300); }
+  .ac-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
   .ac-kind { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--color-ink-700); margin-left: auto; }
 }

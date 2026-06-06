@@ -472,15 +472,29 @@ async function handleApi(req, url) {
       .filter(l => !/^(SET |SELECT pg_catalog|\\|--($| )|$)/.test(l) || /^\s+/.test(l))
       .join("\n").replace(/\n{3,}/g, "\n\n").trim();
     const sql = getPool(db);
-    const indexes = await sql.unsafe(`
-      SELECT s.indexrelname AS name, pg_get_indexdef(s.indexrelid) AS def,
-             pg_relation_size(s.indexrelid) AS bytes, s.idx_scan AS scans,
-             ix.indisunique AS is_unique, ix.indisprimary AS is_primary
-      FROM pg_stat_user_indexes s
-      JOIN pg_index ix ON ix.indexrelid = s.indexrelid
-      WHERE s.schemaname = $1 AND s.relname = $2
-      ORDER BY ix.indisprimary DESC, s.indexrelname`, [schema, table]);
-    return json({ ddl, indexes });
+    const [indexes, stats] = await Promise.all([
+      sql.unsafe(`
+        SELECT s.indexrelname AS name, pg_get_indexdef(s.indexrelid) AS def,
+               pg_relation_size(s.indexrelid) AS bytes, s.idx_scan AS scans,
+               ix.indisunique AS is_unique, ix.indisprimary AS is_primary
+        FROM pg_stat_user_indexes s
+        JOIN pg_index ix ON ix.indexrelid = s.indexrelid
+        WHERE s.schemaname = $1 AND s.relname = $2
+        ORDER BY ix.indisprimary DESC, s.indexrelname`, [schema, table]),
+      // per-column cardinality from the planner's statistics (NULL until ANALYZE has run)
+      sql.unsafe(`
+        SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type,
+               NOT a.attnotnull AS nullable,
+               st.n_distinct, st.null_frac, st.avg_width,
+               c.reltuples::bigint AS est_rows
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_stats st ON st.schemaname = n.nspname AND st.tablename = c.relname AND st.attname = a.attname
+        WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum`, [schema, table]),
+    ]);
+    return json({ ddl, indexes, stats });
   }
 
   // ---- roles & grants (DCL support)
