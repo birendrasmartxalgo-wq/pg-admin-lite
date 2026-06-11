@@ -6,3 +6,6 @@ tools/tailwindcss
 
 node_modules/
 *.log
+
+# runtime sqlite store (saved queries / app state)
+data/

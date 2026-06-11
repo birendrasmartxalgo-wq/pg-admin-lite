@@ -1,356 +1,23 @@
 // pg-admin-lite — minimal pgAdmin4-style database management UI for the local Postgres.
 // Bun built-ins only (Bun.serve, Bun.SQL, Bun.spawn). See ../CLAUDE.md conventions.
-import { SQL } from "bun";
+// Entry point: route dispatch + static serving. Logic lives in server/*.js modules.
+import { PG, getPool, closePool, quoteIdent, validDbName, splitStatements, json, err, readBody } from "./server/db.js";
+import { checkAuth, handleLogin } from "./server/auth.js";
+import { fetchSchema, fetchFks, buildSuggestions, buildPath } from "./server/schema.js";
+import { isMutating, recordAudit, listAudit, listSaved, createSaved, updateSaved, deleteSaved } from "./server/store.js";
+import { friendlyError, handleExplain } from "./server/query.js";
+import { handleAi, aiConfigured } from "./server/ai.js";
 
 const PORT = Number(process.env.PORT || 4601);
 const HOST = process.env.HOST || "0.0.0.0";
-const PG = {
-  host: process.env.PG_HOST || "localhost",
-  port: Number(process.env.PG_PORT || 5432),
-  user: process.env.PG_USER || "appuser",
-  password: process.env.PG_PASSWORD || "",
-  maintDb: process.env.PG_MAINT_DB || "postgres",
-};
-const POOL_MAX = Number(process.env.POOL_MAX || 2);
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-if (!ADMIN_PASSWORD) {
-  console.error("ADMIN_PASSWORD is not set in .env — refusing to start.");
-  process.exit(1);
-}
-
-// ---------------------------------------------------------------- pools
-const pools = new Map(); // dbname -> SQL
-function getPool(db) {
-  if (!pools.has(db)) {
-    pools.set(db, new SQL({
-      hostname: PG.host, port: PG.port, username: PG.user,
-      password: PG.password, database: db, max: POOL_MAX, idleTimeout: 60,
-    }));
-  }
-  return pools.get(db);
-}
-async function closePool(db) {
-  const p = pools.get(db);
-  if (p) { pools.delete(db); try { await p.close(); } catch {} }
-}
-
-const quoteIdent = (s) => '"' + String(s).replace(/"/g, '""') + '"';
-const quoteLit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
-const validDbName = (s) => typeof s === "string" && s.length > 0 && s.length <= 63 && !/[\0\/\\\s"]/.test(s);
-
-// ---------------------------------------------------------------- auth
-const sessions = new Map(); // token -> expiry epoch ms
-const SESSION_TTL = 12 * 60 * 60 * 1000;
-function makeToken() {
-  const b = new Uint8Array(24); crypto.getRandomValues(b);
-  return Buffer.from(b).toString("base64url");
-}
-function checkAuth(req, url) {
-  const h = req.headers.get("authorization");
-  let token = h && h.startsWith("Bearer ") ? h.slice(7) : null;
-  if (!token) token = url.searchParams.get("token"); // for <a download> export links
-  if (!token) return false;
-  const exp = sessions.get(token);
-  if (!exp || exp < Date.now()) { sessions.delete(token); return false; }
-  return true;
-}
-
-// ---------------------------------------------------------------- SQL statement splitter
-// Splits a script on top-level semicolons, respecting '…', E'…', "…", $tag$…$tag$,
-// -- line comments and (nested) /* */ block comments.
-function splitStatements(script) {
-  const out = [];
-  let i = 0, start = 0, n = script.length;
-  while (i < n) {
-    const c = script[i];
-    if (c === "'") {
-      const escaping = /[eE]/.test(script[i - 1] || "") && !/[a-zA-Z0-9_]/.test(script[i - 2] || "");
-      i++;
-      while (i < n) {
-        if (escaping && script[i] === "\\") { i += 2; continue; }
-        if (script[i] === "'") { if (script[i + 1] === "'") { i += 2; continue; } i++; break; }
-        i++;
-      }
-    } else if (c === '"') {
-      i++;
-      while (i < n) { if (script[i] === '"') { if (script[i + 1] === '"') { i += 2; continue; } i++; break; } i++; }
-    } else if (c === "$") {
-      const m = /^\$[a-zA-Z_]?[a-zA-Z0-9_]*\$/.exec(script.slice(i, i + 64));
-      if (m) {
-        const tag = m[0];
-        const end = script.indexOf(tag, i + tag.length);
-        i = end === -1 ? n : end + tag.length;
-      } else i++;
-    } else if (c === "-" && script[i + 1] === "-") {
-      const nl = script.indexOf("\n", i); i = nl === -1 ? n : nl + 1;
-    } else if (c === "/" && script[i + 1] === "*") {
-      let depth = 1; i += 2;
-      while (i < n && depth > 0) {
-        if (script[i] === "/" && script[i + 1] === "*") { depth++; i += 2; }
-        else if (script[i] === "*" && script[i + 1] === "/") { depth--; i += 2; }
-        else i++;
-      }
-    } else if (c === ";") {
-      const stmt = script.slice(start, i).trim();
-      if (stmt) out.push(stmt);
-      i++; start = i;
-    } else i++;
-  }
-  const tail = script.slice(start).trim();
-  if (tail) out.push(tail);
-  return out;
-}
-
-// ---------------------------------------------------------------- helpers
-const json = (data, status = 200) =>
-  new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
-const err = (message, status = 400) => json({ error: message }, status);
-
-async function readBody(req) { try { return await req.json(); } catch { return null; } }
-
-// ---------------------------------------------------------------- schema / relations queries
-async function fetchSchema(db) {
-  const sql = getPool(db);
-  const tables = await sql.unsafe(`
-    SELECT n.nspname AS schema, c.relname AS name,
-           CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'matview' WHEN 'p' THEN 'table' END AS kind,
-           pg_total_relation_size(c.oid) AS bytes,
-           c.reltuples::bigint AS est_rows
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relkind IN ('r','v','m','p')
-      AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
-    ORDER BY n.nspname, c.relname`);
-  const columns = await sql.unsafe(`
-    SELECT table_schema AS schema, table_name AS table, column_name AS name,
-           data_type AS type, is_nullable = 'YES' AS nullable, column_default AS dflt,
-           ordinal_position AS pos
-    FROM information_schema.columns
-    WHERE table_schema NOT IN ('pg_catalog','information_schema')
-    ORDER BY table_schema, table_name, ordinal_position`);
-  const pks = await sql.unsafe(`
-    SELECT n.nspname AS schema, c.relname AS table,
-           (SELECT array_agg(a.attname ORDER BY x.ord)
-              FROM unnest(con.conkey) WITH ORDINALITY x(attnum, ord)
-              JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = x.attnum) AS cols
-    FROM pg_constraint con
-    JOIN pg_class c ON c.oid = con.conrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE con.contype = 'p' AND n.nspname NOT IN ('pg_catalog','information_schema')`);
-  return { tables, columns, pks };
-}
-
-async function fetchFks(db) {
-  const sql = getPool(db);
-  return await sql.unsafe(`
-    SELECT ns1.nspname AS src_schema, c1.relname AS src_table,
-           ns2.nspname AS dst_schema, c2.relname AS dst_table,
-           (SELECT array_agg(a.attname ORDER BY x.ord)
-              FROM unnest(con.conkey) WITH ORDINALITY x(attnum, ord)
-              JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = x.attnum) AS src_cols,
-           (SELECT array_agg(a.attname ORDER BY x.ord)
-              FROM unnest(con.confkey) WITH ORDINALITY x(attnum, ord)
-              JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = x.attnum) AS dst_cols,
-           con.conname AS name
-    FROM pg_constraint con
-    JOIN pg_class c1 ON c1.oid = con.conrelid
-    JOIN pg_namespace ns1 ON ns1.oid = c1.relnamespace
-    JOIN pg_class c2 ON c2.oid = con.confrelid
-    JOIN pg_namespace ns2 ON ns2.oid = c2.relnamespace
-    WHERE con.contype = 'f'
-      AND ns1.nspname NOT IN ('pg_catalog','information_schema')`);
-}
-
-// ---------------------------------------------------------------- join suggestions
-const tkey = (schema, table) => `${schema}.${table}`;
-const fqtn = (schema, table) =>
-  (schema === "public" ? quoteIdent(table) : quoteIdent(schema) + "." + quoteIdent(table));
-
-function joinSql(steps) {
-  // steps: [{schema,table,alias}, {schema,table,alias,on:[[lAlias,lCol,rCol],…]}, …]
-  let sqlText = `SELECT ${steps.map(s => s.alias + ".*").join(", ")}\nFROM ${fqtn(steps[0].schema, steps[0].table)} ${steps[0].alias}`;
-  for (let i = 1; i < steps.length; i++) {
-    const s = steps[i];
-    const conds = s.on.map(([la, lc, rc]) => `${la}.${quoteIdent(lc)} = ${s.alias}.${quoteIdent(rc)}`).join(" AND ");
-    sqlText += `\nJOIN ${fqtn(s.schema, s.table)} ${s.alias} ON ${conds}`;
-  }
-  return sqlText + "\nLIMIT 100;";
-}
-
-function buildSuggestions({ fks, columns, pks }, target) {
-  const colsByTable = new Map();
-  for (const c of columns) {
-    const k = tkey(c.schema, c.table);
-    if (!colsByTable.has(k)) colsByTable.set(k, []);
-    colsByTable.get(k).push(c);
-  }
-  const pkByTable = new Map(pks.map(p => [tkey(p.schema, p.table), p.cols || []]));
-  const suggestions = [];
-  const [tSchema, tTable] = target.includes(".") ? target.split(".", 2) : ["public", target];
-  const tk = tkey(tSchema, tTable);
-
-  // 1. outgoing FKs (high confidence)
-  for (const f of fks) {
-    if (tkey(f.src_schema, f.src_table) !== tk) continue;
-    suggestions.push({
-      kind: "fk", confidence: "high",
-      title: `${tTable} → ${f.dst_table} (FK ${f.name})`,
-      detail: `Foreign key: ${f.src_cols.join(", ")} → ${f.dst_table}(${f.dst_cols.join(", ")})`,
-      sql: joinSql([
-        { schema: tSchema, table: tTable, alias: "t1" },
-        { schema: f.dst_schema, table: f.dst_table, alias: "t2",
-          on: f.src_cols.map((c, i) => ["t1", c, f.dst_cols[i]]) },
-      ]),
-    });
-  }
-  // 2. incoming FKs (high confidence, reverse direction)
-  for (const f of fks) {
-    if (tkey(f.dst_schema, f.dst_table) !== tk) continue;
-    suggestions.push({
-      kind: "fk-reverse", confidence: "high",
-      title: `${tTable} ← ${f.src_table} (referenced by FK ${f.name})`,
-      detail: `${f.src_table}(${f.src_cols.join(", ")}) references ${tTable}(${f.dst_cols.join(", ")})`,
-      sql: joinSql([
-        { schema: tSchema, table: tTable, alias: "t1" },
-        { schema: f.src_schema, table: f.src_table, alias: "t2",
-          on: f.dst_cols.map((c, i) => ["t1", c, f.src_cols[i]]) },
-      ]),
-    });
-  }
-  // 3. two-hop FK paths through an intermediate table
-  for (const f1 of fks) {
-    if (tkey(f1.src_schema, f1.src_table) !== tk) continue;
-    const midK = tkey(f1.dst_schema, f1.dst_table);
-    for (const f2 of fks) {
-      if (tkey(f2.src_schema, f2.src_table) !== midK) continue;
-      if (tkey(f2.dst_schema, f2.dst_table) === tk) continue;
-      suggestions.push({
-        kind: "fk-path", confidence: "medium",
-        title: `${tTable} → ${f1.dst_table} → ${f2.dst_table} (2-hop)`,
-        detail: `Chain through ${f1.dst_table}`,
-        sql: joinSql([
-          { schema: tSchema, table: tTable, alias: "t1" },
-          { schema: f1.dst_schema, table: f1.dst_table, alias: "t2",
-            on: f1.src_cols.map((c, i) => ["t1", c, f1.dst_cols[i]]) },
-          { schema: f2.dst_schema, table: f2.dst_table, alias: "t3",
-            on: f2.src_cols.map((c, i) => ["t2", c, f2.dst_cols[i]]) },
-        ]),
-      });
-    }
-  }
-  // 4. shared column name + type heuristic (e.g. security_id across tick/DB tables)
-  const myCols = colsByTable.get(tk) || [];
-  const seen = new Set(suggestions.map(s => s.title));
-  for (const [otherK, otherCols] of colsByTable) {
-    if (otherK === tk) continue;
-    const [oSchema, oTable] = otherK.split(".");
-    const matches = [];
-    for (const mc of myCols) {
-      const oc = otherCols.find(o => o.name === mc.name && o.type === mc.type);
-      if (!oc) continue;
-      if (/^(created_at|updated_at|id|name|status|mode|notes|description)$/i.test(mc.name)) continue; // generic noise
-      matches.push(mc.name);
-    }
-    if (!matches.length) continue;
-    const otherPk = pkByTable.get(otherK) || [];
-    const isPkMatch = matches.some(m => otherPk.includes(m));
-    const title = `${tTable} ~ ${oTable} on shared column${matches.length > 1 ? "s" : ""} ${matches.join(", ")}`;
-    if (seen.has(title)) continue;
-    suggestions.push({
-      kind: "shared-column", confidence: isPkMatch ? "medium" : "low",
-      title,
-      detail: `Same column name & type${isPkMatch ? " (matches the other table's primary key)" : ""} — verify semantics before trusting`,
-      sql: joinSql([
-        { schema: tSchema, table: tTable, alias: "t1" },
-        { schema: oSchema, table: oTable, alias: "t2", on: matches.map(m => ["t1", m, m]) },
-      ]),
-    });
-  }
-  const rank = { high: 0, medium: 1, low: 2 };
-  suggestions.sort((a, b) => rank[a.confidence] - rank[b.confidence]);
-  return suggestions;
-}
-
-function buildPath({ fks, columns }, from, to) {
-  // BFS over FK edges (both directions); falls back to shared-column edges.
-  const edges = new Map(); // key -> [{to, on:[[lCol,rCol]], via}]
-  const addEdge = (a, b, on, via) => {
-    if (!edges.has(a)) edges.set(a, []);
-    edges.get(a).push({ to: b, on, via });
-  };
-  for (const f of fks) {
-    const a = tkey(f.src_schema, f.src_table), b = tkey(f.dst_schema, f.dst_table);
-    addEdge(a, b, f.src_cols.map((c, i) => [c, f.dst_cols[i]]), `FK ${f.name}`);
-    addEdge(b, a, f.dst_cols.map((c, i) => [c, f.src_cols[i]]), `FK ${f.name} (reverse)`);
-  }
-  const colsByTable = new Map();
-  for (const c of columns) {
-    const k = tkey(c.schema, c.table);
-    if (!colsByTable.has(k)) colsByTable.set(k, []);
-    colsByTable.get(k).push(c);
-  }
-  const norm = (t) => (t.includes(".") ? t : "public." + t);
-  const src = norm(from), dst = norm(to);
-
-  const bfs = (useShared) => {
-    const allEdges = new Map(edges);
-    if (useShared) {
-      const keys = [...colsByTable.keys()];
-      for (const a of keys) for (const b of keys) {
-        if (a === b) continue;
-        const shared = (colsByTable.get(a) || [])
-          .filter(ca => !/^(created_at|updated_at|id|name|status|mode)$/i.test(ca.name))
-          .filter(ca => (colsByTable.get(b) || []).some(cb => cb.name === ca.name && cb.type === ca.type))
-          .map(ca => [ca.name, ca.name]);
-        if (shared.length) {
-          if (!allEdges.has(a)) allEdges.set(a, []);
-          allEdges.get(a).push({ to: b, on: shared, via: `shared column ${shared.map(s => s[0]).join(", ")}` });
-        }
-      }
-    }
-    const prev = new Map([[src, null]]);
-    const q = [src];
-    while (q.length) {
-      const cur = q.shift();
-      if (cur === dst) break;
-      for (const e of allEdges.get(cur) || []) {
-        if (prev.has(e.to)) continue;
-        prev.set(e.to, { from: cur, edge: e });
-        q.push(e.to);
-      }
-    }
-    if (!prev.has(dst)) return null;
-    const chain = [];
-    let cur = dst;
-    while (prev.get(cur)) { chain.unshift({ table: cur, ...prev.get(cur) }); cur = prev.get(cur).from; }
-    return chain;
-  };
-
-  const chain = bfs(false) || bfs(true);
-  if (!chain) return null;
-  const steps = [{ schema: src.split(".")[0], table: src.split(".")[1], alias: "t1" }];
-  const aliasOf = new Map([[src, "t1"]]);
-  const vias = [];
-  chain.forEach((step, i) => {
-    const alias = "t" + (i + 2);
-    aliasOf.set(step.table, alias);
-    const [sch, tbl] = step.table.split(".");
-    steps.push({ schema: sch, table: tbl, alias, on: step.edge.on.map(([l, r]) => [aliasOf.get(step.from), l, r]) });
-    vias.push(step.edge.via);
-  });
-  return { sql: joinSql(steps), via: vias };
-}
 
 // ---------------------------------------------------------------- route handlers
-async function handleApi(req, url) {
+async function handleApi(req, url, ip) {
   const path = url.pathname;
   const method = req.method;
 
   if (path === "/api/login" && method === "POST") {
-    const body = await readBody(req);
-    if (!body || body.password !== ADMIN_PASSWORD) return err("Invalid password", 401);
-    const token = makeToken();
-    sessions.set(token, Date.now() + SESSION_TTL);
-    return json({ token });
+    return handleLogin(req, ip);
   }
 
   if (!checkAuth(req, url)) return err("Unauthorized", 401);
@@ -364,7 +31,7 @@ async function handleApi(req, url) {
              pg_encoding_to_char(d.encoding) AS encoding,
              (SELECT count(*) FROM pg_stat_activity a WHERE a.datname = d.datname) AS connections
       FROM pg_database d WHERE NOT d.datistemplate ORDER BY d.datname`);
-    return json({ databases: rows });
+    return json({ databases: rows, ai: aiConfigured() });
   }
   if (path === "/api/databases" && method === "POST") {
     const body = await readBody(req);
@@ -374,6 +41,7 @@ async function handleApi(req, url) {
     if (body.owner) ddl += ` OWNER ${quoteIdent(body.owner)}`;
     if (body.template && validDbName(body.template)) ddl += ` TEMPLATE ${quoteIdent(body.template)}`;
     await sql.unsafe(ddl);
+    recordAudit({ db: PG.maintDb, sql: ddl, command: "CREATE DATABASE", ok: true, ip });
     return json({ ok: true, ddl });
   }
   let m = path.match(/^\/api\/databases\/([^/]+)$/);
@@ -384,22 +52,49 @@ async function handleApi(req, url) {
     await closePool(name); // drop our own connections first
     const sql = getPool(PG.maintDb);
     await sql.unsafe(`DROP DATABASE ${quoteIdent(name)} WITH (FORCE)`);
+    recordAudit({ db: PG.maintDb, sql: `DROP DATABASE ${quoteIdent(name)} WITH (FORCE)`, command: "DROP DATABASE", ok: true, ip });
     return json({ ok: true });
+  }
+
+  // ---- saved queries (bun:sqlite, local — never written into user DBs)
+  if (path === "/api/saved" && method === "GET") return json({ queries: listSaved() });
+  if (path === "/api/saved" && method === "POST") {
+    const body = await readBody(req);
+    if (!body?.name?.trim() || typeof body.sql !== "string" || !body.sql.trim()) return err("Expected { name, sql }");
+    try { return json({ id: createSaved({ name: body.name.trim(), sql: body.sql, db: body.db }) }); }
+    catch (e) { return err(/UNIQUE/.test(e?.message || "") ? `A saved query named "${body.name.trim()}" already exists` : e.message); }
+  }
+  m = path.match(/^\/api\/saved\/(\d+)$/);
+  if (m && method === "PUT") {
+    const body = await readBody(req);
+    if (!body?.name?.trim() || typeof body.sql !== "string") return err("Expected { name, sql }");
+    return updateSaved(Number(m[1]), { name: body.name.trim(), sql: body.sql, db: body.db })
+      ? json({ ok: true }) : err("Not found", 404);
+  }
+  if (m && method === "DELETE") {
+    return deleteSaved(Number(m[1])) ? json({ ok: true }) : err("Not found", 404);
+  }
+
+  // ---- audit log (read-only; writes happen inside /api/query)
+  if (path === "/api/audit" && method === "GET") {
+    return json({ entries: listAudit(url.searchParams.get("limit")) });
   }
 
   const db = url.searchParams.get("db");
   const needDb = () => { if (!db || !validDbName(db)) throw new Error("Missing or invalid ?db= parameter"); };
 
-  // ---- schema tree
+  // ---- schema tree (FKs included for context-aware autocomplete)
   if (path === "/api/schema" && method === "GET") {
     needDb();
-    return json(await fetchSchema(db));
+    const [schema, fks] = await Promise.all([fetchSchema(db), fetchFks(db)]);
+    return json({ ...schema, fks });
   }
 
   // ---- query execution (DDL / DML / DCL)
   if (path === "/api/query" && method === "POST") {
     const body = await readBody(req);
     if (!body || !validDbName(body.db) || typeof body.sql !== "string") return err("Expected { db, sql }");
+    const tServer = performance.now(); // request fully received — everything until the return is our cost
     const maxRows = Math.min(Number(body.maxRows) || 500, 5000);
     const stmts = splitStatements(body.sql);
     if (!stmts.length) return err("No statements to execute");
@@ -412,23 +107,28 @@ async function handleApi(req, url) {
         try {
           const r = await conn.unsafe(stmt);
           const rows = Array.isArray(r) ? r : [];
+          const rowCount = typeof r?.count === "number" && r.count > 0 ? r.count : rows.length;
           results.push({
             ok: true,
             statement: stmt.length > 200 ? stmt.slice(0, 200) + "…" : stmt,
             command: r?.command ?? null,
-            rowCount: typeof r?.count === "number" && r.count > 0 ? r.count : rows.length,
+            rowCount,
             truncated: rows.length > maxRows,
             rows: rows.slice(0, maxRows),
             columns: rows.length ? Object.keys(rows[0]) : [],
             ms: Math.round(performance.now() - t0),
           });
+          if (isMutating(stmt)) recordAudit({ db: body.db, sql: stmt, command: r?.command, rowCount, ok: true, ip });
         } catch (e) {
           results.push({
             ok: false,
             statement: stmt.length > 200 ? stmt.slice(0, 200) + "…" : stmt,
             error: e?.message || String(e),
+            sqlstate: e?.errno ? String(e.errno) : null,
+            ...(await friendlyError(e, body.db)),
             ms: Math.round(performance.now() - t0),
           });
+          if (isMutating(stmt)) recordAudit({ db: body.db, sql: stmt, ok: false, ip, error: e?.message });
           try { await conn.unsafe("ROLLBACK"); } catch {} // clear aborted tx so the session is reusable
           break; // stop the batch at first error, like psql ON_ERROR_STOP
         }
@@ -436,7 +136,27 @@ async function handleApi(req, url) {
     } finally {
       conn.release();
     }
-    return json({ results });
+    // serverMs = receive→response-build (pool acquire + split + exec + row shaping); excludes final JSON encode
+    return json({ results, serverMs: Math.round(performance.now() - tServer) });
+  }
+
+  // ---- AI proxy: NL→SQL generation + error fixing (key stays server-side)
+  if (path === "/api/ai" && method === "POST") {
+    const body = await readBody(req);
+    if (!body || !validDbName(body.db)) return err("Expected { db, mode, … }");
+    return handleAi(body);
+  }
+
+  // ---- EXPLAIN / query plan (ANALYZE refused server-side for mutating SQL)
+  if (path === "/api/explain" && method === "POST") {
+    const body = await readBody(req);
+    if (!body || !validDbName(body.db) || typeof body.sql !== "string" || !body.sql.trim()) return err("Expected { db, sql }");
+    try {
+      return json(await handleExplain(body));
+    } catch (e) {
+      return json({ error: e?.message || String(e), sqlstate: e?.errno ? String(e.errno) : null,
+        ...(await friendlyError(e, body.db)) }, 400);
+    }
   }
 
   // ---- join suggestions
@@ -571,11 +291,12 @@ Bun.serve({
   port: PORT,
   hostname: HOST,
   idleTimeout: 120,
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url);
     if (url.pathname.startsWith("/api/")) {
       try {
-        const res = await handleApi(req, url);
+        const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim() || server.requestIP(req)?.address || "";
+        const res = await handleApi(req, url, ip);
         // gzip JSON payloads >1 KB — big result sets shrink ~5-10x, which is most
         // of the browser-observed "wall" time on remote links (server time is ~1ms)
         if (res.headers.get("content-type")?.includes("application/json") &&
@@ -601,6 +322,16 @@ Bun.serve({
       if (gzipOk) return new Response(Bun.gzipSync(new Uint8Array(await f.arrayBuffer()), { level: 4 }),
         { headers: { "content-type": "text/html;charset=utf-8", "content-encoding": "gzip", "vary": "accept-encoding" } });
       return new Response(f);
+    }
+    if (url.pathname.startsWith("/js/") && !url.pathname.includes("..") && url.pathname.endsWith(".js")) {
+      const f = Bun.file(import.meta.dir + "/public" + url.pathname);
+      if (await f.exists()) {
+        if (gzipOk) {
+          return new Response(Bun.gzipSync(new Uint8Array(await f.arrayBuffer()), { level: 4 }),
+            { headers: { "content-type": "text/javascript;charset=utf-8", "content-encoding": "gzip", "vary": "accept-encoding" } });
+        }
+        return new Response(f, { headers: { "content-type": "text/javascript;charset=utf-8" } });
+      }
     }
     if (url.pathname.startsWith("/assets/") && !url.pathname.includes("..")) {
       const f = Bun.file(import.meta.dir + "/public" + url.pathname);

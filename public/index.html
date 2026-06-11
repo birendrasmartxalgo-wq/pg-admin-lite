@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pg-admin-lite · the ledger</title>
 <script>if (localStorage.getItem("pgal_dark") === "1") document.documentElement.classList.add("dark");</script>
-<link rel="stylesheet" href="/assets/tw.css?v=ledger3">
+<link rel="stylesheet" href="/assets/tw.css?v=ledger5">
 <style>
   /* tiny bits that are easier inline than as utilities */
   #sqlbox { tab-size: 2; }
@@ -102,7 +102,13 @@
             </select>
             <label class="mlabel flex items-center gap-1.5">rows / page <input id="maxrows" type="number" value="100" min="1" max="5000" class="input w-20 py-1 text-xs font-mono"></label>
             <span class="flex-1"></span>
+            <button class="btn btn-sm" id="askaibtn" onclick="openAskAi()"><span data-ic="sparkles" data-s="13"></span>Ask AI</button>
+            <button class="btn btn-sm" id="savedbtn" onclick="toggleSaved()"><span data-ic="bookmark" data-s="13"></span>Saved</button>
             <button class="btn btn-sm" id="histbtn" onclick="toggleHistory()"><span data-ic="history" data-s="13"></span>History</button>
+            <span class="flex items-center">
+              <button class="btn btn-sm !rounded-r-none" id="explainbtn" onclick="runExplain()" title="Show the query plan"><span data-ic="gauge" data-s="13"></span>Explain</button>
+              <label class="btn btn-sm !rounded-l-none !border-l-0 text-[11px] gap-1" title="EXPLAIN ANALYZE actually executes the query — disabled for mutating SQL"><input type="checkbox" id="explainanalyze" class="accent-quill-500">analyze</label>
+            </span>
             <button class="btn btn-primary" onclick="runQuery()"><span data-ic="play" data-s="13"></span>Run<kbd class="ml-1">⌃↵</kbd></button>
           </div>
           <div class="relative">
@@ -122,6 +128,14 @@
           </div>
           <div id="histlist" class="overflow-y-auto flex-1 p-2 flex flex-col gap-1.5"></div>
         </div>
+        <!-- saved-queries drawer -->
+        <div id="saveddrawer" class="hidden w-[300px] flex-none border-l border-rule-700 bg-paper-900 flex-col min-h-0">
+          <div class="flex items-center justify-between px-3 h-10 border-b border-rule-700 flex-none">
+            <span class="mlabel">saved queries</span>
+            <button class="btn btn-sm btn-primary" title="Save the current editor SQL" onclick="saveCurrentQuery()"><span data-ic="plus" data-s="12"></span>Save current</button>
+          </div>
+          <div id="savedlist" class="overflow-y-auto flex-1 p-2 flex flex-col gap-1.5"></div>
+        </div>
       </div>
     </section>
 
@@ -130,6 +144,7 @@
       <div class="flex items-center gap-3">
         <h2 class="font-display font-semibold italic text-[16px] tracking-tight flex items-center gap-2"><span data-ic="filecode" data-s="16" class="text-quill-400"></span><span id="tbl-title" class="font-mono">—</span></h2>
         <span class="flex-1"></span>
+        <button class="btn btn-sm" onclick="if(activeTable) openInsertRow(activeTable.schema, activeTable.name)"><span data-ic="rowinsert" data-s="12"></span>New row</button>
         <button class="btn btn-sm" onclick="if(activeTable) selectTable(activeTable.schema, activeTable.name)"><span data-ic="play" data-s="12"></span>Browse rows</button>
         <button class="btn btn-sm" onclick="loadTableDef(true)"><span data-ic="refresh" data-s="12"></span>Refresh</button>
       </div>
@@ -152,19 +167,62 @@
 
     <!-- ──────── BUILDER ──────── -->
     <section class="tabpane flex-1 min-h-0 hidden data-[on]:flex flex-col gap-3 p-4 overflow-y-auto" id="tab-create">
-      <h2 class="font-display font-semibold italic text-[16px] tracking-tight flex items-center gap-2"><span data-ic="wrench" data-s="16" class="text-quill-400"></span>Create table</h2>
-      <div class="flex items-center gap-2">
-        <input id="ct-schema" value="public" class="input w-32 font-mono text-xs" placeholder="schema">
-        <input id="ct-name" class="input w-52 font-mono text-xs" placeholder="table_name" oninput="renderDdl()">
-        <button class="btn btn-sm" onclick="addColRow()"><span data-ic="plus" data-s="12"></span>Column</button>
+      <div class="flex items-center gap-3">
+        <h2 class="font-display font-semibold italic text-[16px] tracking-tight flex items-center gap-2"><span data-ic="wrench" data-s="16" class="text-quill-400"></span>Table builder</h2>
+        <span class="flex items-center ml-2">
+          <button class="btn btn-sm !rounded-r-none" id="bmode-create" onclick="builderMode('create')">Create</button>
+          <button class="btn btn-sm !rounded-l-none !border-l-0" id="bmode-alter" onclick="builderMode('alter')">Alter existing</button>
+        </span>
       </div>
-      <div id="ct-cols" class="flex flex-col gap-1.5"></div>
-      <div class="mlabel">name · type · nullable · default · pk · remove</div>
-      <div class="mlabel mt-2">generated ddl</div>
-      <pre class="sqlblock" id="ct-ddl">--</pre>
-      <div class="flex gap-2">
-        <button class="btn btn-primary" onclick="execDdl()"><span data-ic="play" data-s="13"></span>Execute DDL</button>
-        <button class="btn" onclick="ddlToEditor()"><span data-ic="terminal" data-s="13"></span>Open in console</button>
+
+      <!-- CREATE pane -->
+      <div id="builder-create" class="flex flex-col gap-3">
+        <div class="flex items-center gap-2 flex-wrap">
+          <input id="ct-schema" value="public" class="input w-32 font-mono text-xs" placeholder="schema">
+          <input id="ct-name" class="input w-52 font-mono text-xs" placeholder="table_name" oninput="renderDdl()">
+          <button class="btn btn-sm" onclick="addColRow()"><span data-ic="plus" data-s="12"></span>Column</button>
+          <span class="mlabel mx-1">constraints &amp; indexes:</span>
+          <button class="btn btn-sm" onclick="addConstraintRow('unique')">+ Unique</button>
+          <button class="btn btn-sm" onclick="addConstraintRow('check')">+ Check</button>
+          <button class="btn btn-sm" onclick="addConstraintRow('fk')">+ Foreign key</button>
+          <button class="btn btn-sm" onclick="addConstraintRow('index')">+ Index</button>
+        </div>
+        <div id="ct-cols" class="flex flex-col gap-1.5"></div>
+        <div class="mlabel">name · type · null · default · pk · unique · identity · check (expr) · remove</div>
+        <div id="ct-constraints" class="flex flex-col gap-1.5"></div>
+        <div class="mlabel mt-2">generated ddl</div>
+        <pre class="sqlblock" id="ct-ddl">--</pre>
+        <div class="flex gap-2">
+          <button class="btn btn-primary" onclick="execDdl()"><span data-ic="play" data-s="13"></span>Execute DDL</button>
+          <button class="btn" onclick="ddlToEditor()"><span data-ic="terminal" data-s="13"></span>Open in console</button>
+        </div>
+      </div>
+
+      <!-- ALTER pane -->
+      <div id="builder-alter" class="hidden flex-col gap-3">
+        <div class="flex items-center gap-2 flex-wrap">
+          <select id="alt-table" class="input text-xs w-64 font-mono" onchange="altTableChanged()"><option value="">Pick a table…</option></select>
+          <span class="mlabel" id="alt-meta"></span>
+        </div>
+        <div class="flex items-center gap-1.5 flex-wrap" id="alt-ops">
+          <button class="btn btn-sm" data-op="addcol" onclick="altOp('addcol')">Add column</button>
+          <button class="btn btn-sm" data-op="dropcol" onclick="altOp('dropcol')">Drop column</button>
+          <button class="btn btn-sm" data-op="rencol" onclick="altOp('rencol')">Rename column</button>
+          <button class="btn btn-sm" data-op="rettype" onclick="altOp('rettype')">Change type</button>
+          <button class="btn btn-sm" data-op="dflt" onclick="altOp('dflt')">Default</button>
+          <button class="btn btn-sm" data-op="notnull" onclick="altOp('notnull')">Not null</button>
+          <button class="btn btn-sm" data-op="addidx" onclick="altOp('addidx')">Add index</button>
+          <button class="btn btn-sm" data-op="dropidx" onclick="altOp('dropidx')">Drop index</button>
+          <button class="btn btn-sm" data-op="addfk" onclick="altOp('addfk')">Add foreign key</button>
+          <button class="btn btn-sm" data-op="dropcon" onclick="altOp('dropcon')">Drop constraint</button>
+        </div>
+        <div id="alt-form" class="panel p-3 hidden"></div>
+        <div class="mlabel">generated ddl · review before executing</div>
+        <pre class="sqlblock" id="alt-ddl"><span class="cmt">-- pick a table and an operation</span></pre>
+        <div class="flex gap-2">
+          <button class="btn btn-primary" onclick="execAlterDdl()"><span data-ic="play" data-s="13"></span>Execute</button>
+          <button class="btn" onclick="alterToEditor()"><span data-ic="terminal" data-s="13"></span>Open in console</button>
+        </div>
       </div>
     </section>
 
@@ -222,6 +280,13 @@
         <div class="mlabel mb-3">table grants in <b id="grants-db" class="text-quill-400">…</b></div>
         <div id="grants-out" class="gridscroll"></div>
       </div>
+      <div class="panel p-4">
+        <div class="flex items-center justify-between mb-3">
+          <span class="mlabel">audit log · every mutating statement run from this console</span>
+          <button class="btn btn-sm btn-icon" onclick="loadAudit()"><span data-ic="refresh" data-s="12"></span></button>
+        </div>
+        <div id="audit-out" class="gridscroll max-h-[420px]"></div>
+      </div>
     </section>
   </main>
 </div>
@@ -240,1118 +305,16 @@
   <div id="modalcard" class="notch panel !bg-paper-850 w-full max-w-[620px] max-h-[85vh] flex flex-col reveal shadow-[0_24px_60px_-12px_rgba(34,28,16,0.5)]"></div>
 </div>
 
-<script>
-/* ════════════════ icons (lucide, inlined — no npm, no CDN) ════════════════ */
-const I = {
-  database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
-  table: '<path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/>',
-  eye: '<path d="M2.06 12.35a1 1 0 0 1 0-.7 10.75 10.75 0 0 1 19.88 0 1 1 0 0 1 0 .7 10.75 10.75 0 0 1-19.88 0"/><circle cx="12" cy="12" r="3"/>',
-  key: '<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>',
-  play: '<polygon points="6 3 20 12 6 21 6 3"/>',
-  plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
-  refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
-  trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
-  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
-  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
-  shield: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
-  history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
-  copy: '<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
-  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
-  terminal: '<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>',
-  filecode: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="m10 12-2 2 2 2"/><path d="m14 16 2-2-2-2"/>',
-  wrench: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
-  merge: '<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/>',
-  swap: '<path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/>',
-  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
-  chevron: '<path d="m9 18 6-6-6-6"/>',
-  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
-  zap: '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
-  keyround: '<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>',
-  arrowright: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
-  layers: '<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>',
-  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
-  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
-};
-const ic = (n, s = 14, cls = "") =>
-  `<svg class="${cls}" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:none">${I[n] || ""}</svg>`;
-function hydrateIcons(root = document) {
-  root.querySelectorAll("[data-ic]").forEach(e => { e.innerHTML = ic(e.dataset.ic, Number(e.dataset.s || 14)); });
-}
-hydrateIcons();
-
-/* ════════════════ day / night ledger ════════════════ */
-function renderDarkIc() {
-  document.getElementById("darkic").innerHTML = ic(document.documentElement.classList.contains("dark") ? "sun" : "moon", 14);
-}
-function toggleDark() {
-  const dark = document.documentElement.classList.toggle("dark");
-  localStorage.setItem("pgal_dark", dark ? "1" : "0");
-  renderDarkIc();
-}
-renderDarkIc();
-
-/* ════════════════ state & helpers ════════════════ */
-let token = localStorage.getItem("pgal_token") || "";
-let currentDb = localStorage.getItem("pgal_db") || "";
-let activeTable = null;          // {schema, name}
-let schemaCache = {};            // db -> {tables, columns, pks}
-
-async function api(path, opts = {}) {
-  opts.headers = Object.assign({ authorization: "Bearer " + token }, opts.headers || {});
-  const res = await fetch(path, opts);
-  if (res.status === 401) { showLogin(); throw new Error("Unauthorized"); }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
-  return data;
-}
-function toast(msg, isError = false) {
-  const d = document.createElement("div");
-  d.className = "toastmsg" + (isError ? " error" : "");
-  d.textContent = msg;
-  document.getElementById("toast").appendChild(d);
-  setTimeout(() => d.remove(), isError ? 8000 : 4000);
-}
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const escPre = s => String(s ?? "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
-const fmtBytes = b => { b = Number(b); if (!b) return "0 B"; const u = ["B","KB","MB","GB","TB"]; const i = Math.floor(Math.log(b)/Math.log(1024)); return (b/1024**i).toFixed(i?1:0) + " " + u[i]; };
-const ago = t => { const s = (Date.now() - t) / 1000; if (s < 60) return Math.floor(s) + "s"; if (s < 3600) return Math.floor(s/60) + "m"; if (s < 86400) return Math.floor(s/3600) + "h"; return Math.floor(s/86400) + "d"; };
-
-/* SQL syntax highlight for <pre class=sqlblock> */
-const SQL_KEYWORDS = new Set("SELECT FROM WHERE INSERT INTO VALUES UPDATE SET DELETE CREATE TABLE ALTER DROP INDEX VIEW JOIN INNER LEFT RIGHT FULL OUTER ON GROUP BY ORDER HAVING LIMIT OFFSET DISTINCT AND OR NOT NULL IS IN EXISTS BETWEEN LIKE ILIKE AS UNION ALL CASE WHEN THEN ELSE END BEGIN COMMIT ROLLBACK GRANT REVOKE PRIMARY KEY FOREIGN REFERENCES UNIQUE DEFAULT CASCADE RETURNING WITH EXPLAIN ANALYZE TRUNCATE CONSTRAINT ADD COLUMN OWNER TO USING BTREE ONLY IF TEXT INTEGER BIGINT SMALLINT BOOLEAN NUMERIC TIMESTAMPTZ TIMESTAMP JSONB UUID BYTEA SERIAL BIGSERIAL VARCHAR CHARACTER VARYING DOUBLE PRECISION DATE TIME ZONE WITHOUT COUNT SUM AVG MIN MAX COALESCE NULLIF NOW INTERVAL EXTRACT DATE_TRUNC".split(" "));
-function hlSql(sql) {
-  return escPre(sql).replace(/(--[^\n]*)|('(?:[^']|'')*')|(\b\d+(?:\.\d+)?\b)|([A-Za-z_]+)/g, (m, cmt, str, num, word) => {
-    if (cmt) return `<span class="cmt">${cmt}</span>`;
-    if (str) return `<span class="str">${str}</span>`;
-    if (num) return `<span class="num">${num}</span>`;
-    if (word && SQL_KEYWORDS.has(word.toUpperCase())) return `<span class="kw">${word}</span>`;
-    return m;
-  });
-}
-
-/* ════════════════ modal ════════════════ */
-const modalEl = document.getElementById("modal"), modalCard = document.getElementById("modalcard");
-let modalResolve = null;
-function openModal(html) {
-  modalCard.innerHTML = html;
-  modalEl.style.display = "flex";
-  modalCard.classList.remove("reveal"); void modalCard.offsetWidth; modalCard.classList.add("reveal");
-}
-function closeModal(result = false) {
-  modalEl.style.display = "none";
-  if (modalResolve) { modalResolve(result); modalResolve = null; }
-}
-modalEl.addEventListener("mousedown", e => { if (e.target === modalEl) closeModal(false); });
-document.addEventListener("keydown", e => { if (e.key === "Escape" && modalEl.style.display === "flex") closeModal(false); });
-
-/* destructive-statement detection — strings/comments stripped first */
-function classifyDanger(sql) {
-  const clean = sql.replace(/'(?:[^']|'')*'/g, "''").replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
-  const warns = [];
-  for (const s of clean.split(";").map(x => x.trim()).filter(Boolean)) {
-    const hasWhere = /\bwhere\b/i.test(s);
-    let m;
-    if ((m = s.match(/^drop\s+(table|database|schema|view|index|role|sequence|function)\s+(?:if\s+exists\s+)?([\w".,\s]+)/i)))
-      warns.push({ level: "red", text: `DROP ${m[1].toUpperCase()} ${m[2].trim().split(/\s/)[0]}`, note: "irreversible" });
-    else if ((m = s.match(/^truncate\s+(?:table\s+)?(?:only\s+)?([\w".]+)/i)))
-      warns.push({ level: "red", text: `TRUNCATE ${m[1]}`, note: "removes every row" });
-    else if ((m = s.match(/^delete\s+from\s+(?:only\s+)?([\w".]+)/i)))
-      warns.push(hasWhere ? { level: "amber", text: `DELETE FROM ${m[1]}`, note: "with WHERE" }
-                          : { level: "red", text: `DELETE FROM ${m[1]}`, note: "NO WHERE — deletes ALL rows" });
-    else if ((m = s.match(/^update\s+(?:only\s+)?([\w".]+)/i)))
-      warns.push(hasWhere ? { level: "amber", text: `UPDATE ${m[1]}`, note: "with WHERE" }
-                          : { level: "red", text: `UPDATE ${m[1]}`, note: "NO WHERE — rewrites ALL rows" });
-    else if ((m = s.match(/^alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w".]+)[\s\S]*?\bdrop\b/i)))
-      warns.push({ level: "red", text: `ALTER TABLE ${m[1]} … DROP`, note: "drops a column/constraint" });
-  }
-  return warns;
-}
-function confirmDanger(warns, sql) {
-  const worst = warns.some(w => w.level === "red") ? "red" : "amber";
-  return new Promise(resolve => {
-    modalResolve = resolve;
-    openModal(`
-      <div class="flex items-center gap-3 px-5 py-4 border-b border-rule-700">
-        <span class="led led-${worst}"></span>
-        <span class="font-display font-semibold italic text-[16px]">Confirm before it's inked</span>
-        <span class="chip chip-${worst === "red" ? "red" : "amber"} ml-auto">${worst === "red" ? "destructive" : "mutating"}</span>
-      </div>
-      <div class="px-5 py-4 flex flex-col gap-3 overflow-y-auto">
-        <div class="text-ink-300 text-xs">This will run on <b class="font-mono text-quill-400">${esc(currentDb)}</b> and cannot be undone once committed:</div>
-        <div class="flex flex-col gap-1.5">${warns.map(w => `
-          <div class="flex items-center gap-2 font-mono text-[11.5px]">
-            <span class="chip chip-${w.level === "red" ? "red" : "amber"}">${w.level === "red" ? "✕" : "!"}</span>
-            <span class="text-ink-100">${esc(w.text)}</span>
-            <span class="text-${w.level === "red" ? "red-led" : "amber-led"} ml-auto">${esc(w.note)}</span>
-          </div>`).join("")}
-        </div>
-        <pre class="sqlblock max-h-48 overflow-y-auto">${hlSql(sql)}</pre>
-      </div>
-      <div class="flex items-center justify-end gap-2 px-5 py-3.5 border-t border-rule-700">
-        <button class="btn" onclick="closeModal(false)">Cancel</button>
-        <button class="btn ${worst === "red" ? "btn-danger" : "btn-primary"}" onclick="closeModal(true)"><span data-ic="play" data-s="13"></span>Run it</button>
-      </div>`);
-    hydrateIcons(modalCard);
-  });
-}
-
-const qid = s => '"' + String(s).replace(/"/g, '""') + '"';
-/* SQL literal builder for generated UPDATEs / INSERT exports */
-function sqlLit(v, type = "") {
-  if (v === null || v === undefined) return "NULL";
-  const t = type.toLowerCase();
-  if (typeof v === "object") return "'" + JSON.stringify(v).replace(/'/g, "''") + "'" + (/json/.test(t) ? "::" + (t.includes("jsonb") ? "jsonb" : "json") : "");
-  const s = String(v);
-  if (/int|numeric|real|double|decimal|serial/.test(t) && /^-?\d+(\.\d+)?$/.test(s)) return s;
-  if (/bool/.test(t) && /^(true|false)$/i.test(s)) return s.toLowerCase();
-  return "'" + s.replace(/'/g, "''") + "'";
-}
-
-/* ════════════════ auth ════════════════ */
-function showLogin() { document.getElementById("login").style.display = "flex"; }
-async function doLogin() {
-  const pw = document.getElementById("pw").value;
-  try {
-    const r = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: pw }) });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.error || "Login failed");
-    token = data.token; localStorage.setItem("pgal_token", token);
-    document.getElementById("login").style.display = "none";
-    init();
-  } catch (e) { document.getElementById("loginerr").textContent = "✕ " + e.message; }
-}
-document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
-function logout() { localStorage.removeItem("pgal_token"); token = ""; showLogin(); }
-
-/* ════════════════ tabs ════════════════ */
-function showTab(name) {
-  document.querySelectorAll(".tabpane").forEach(p => p.removeAttribute("data-on"));
-  document.querySelectorAll("nav .tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
-  document.getElementById("tab-" + name).setAttribute("data-on", "");
-  if (name === "roles") { loadRoles(); loadGrants(); }
-  if (name === "joins") fillTableSelects();
-  if (name === "impexp") fillDbSelects();
-  if (name === "table") loadTableDef();
-}
-
-/* ════════════════ databases sidebar ════════════════ */
-let databases = [];
-async function loadDatabases() {
-  const t0 = performance.now();
-  const { databases: dbs } = await api("/api/databases");
-  const ms = Math.round(performance.now() - t0);
-  document.getElementById("latency").innerHTML = `<span class="led led-green"></span><span>online · ${ms}ms</span>`;
-  databases = dbs;
-  const el = document.getElementById("dblist");
-  el.innerHTML = "";
-  for (const d of dbs) {
-    const item = document.createElement("div");
-    item.className = "mb-0.5";
-    item.innerHTML = `
-      <div class="dbrow group flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer hover:bg-paper-800 ${d.name === currentDb ? "bg-paper-700 ring-1 ring-rule-500" : ""}" data-db="${esc(d.name)}">
-        <span class="text-quill-400">${ic("database", 13)}</span>
-        <span class="dbname font-medium text-[12.5px] flex-1 truncate">${esc(d.name)}</span>
-        <span class="font-mono text-[10px] text-ink-700">${fmtBytes(d.bytes)} · ${d.connections}c</span>
-        <button class="btn btn-sm btn-icon btn-danger opacity-0 group-hover:opacity-100 transition-opacity" title="Drop database" data-drop="${esc(d.name)}">${ic("trash", 11)}</button>
-      </div>
-      <div class="tree ml-4 border-l border-rule-700 pl-2" id="tree-${esc(d.name)}"></div>`;
-    item.querySelector(".dbrow").addEventListener("click", () => selectDb(d.name));
-    item.querySelector("[data-drop]").addEventListener("click", e => { e.stopPropagation(); dropDb(d.name); });
-    el.appendChild(item);
-  }
-  fillDbSelects();
-  if (currentDb && dbs.some(d => d.name === currentDb)) selectDb(currentDb, true);
-}
-async function selectDb(name) {
-  if (currentDb !== name) browse = null; // cursors are per-table, per-db
-  currentDb = name;
-  localStorage.setItem("pgal_db", name);
-  document.getElementById("curdb").textContent = name;
-  document.querySelectorAll(".dbrow").forEach(r => {
-    const on = r.dataset.db === name;
-    r.classList.toggle("bg-paper-700", on);
-    r.classList.toggle("ring-1", on);
-    r.classList.toggle("ring-rule-500", on);
-  });
-  await loadTree(name);
-  fillTableSelects();
-}
-async function loadTree(db) {
-  const el = document.getElementById("tree-" + db);
-  if (!el) return;
-  el.innerHTML = `<div class="mlabel py-1">loading…</div>`;
-  try {
-    const schema = await api("/api/schema?db=" + encodeURIComponent(db));
-    schemaCache[db] = schema;
-    el.innerHTML = "";
-    for (const t of schema.tables) {
-      const cols = schema.columns.filter(c => c.schema === t.schema && c.table === t.name);
-      const pk = (schema.pks.find(p => p.schema === t.schema && p.table === t.name) || {}).cols || [];
-      const node = document.createElement("div");
-      const label = (t.schema !== "public" ? t.schema + "." : "") + t.name;
-      node.innerHTML = `
-        <div class="tnode flex items-center gap-1 px-1 py-[3px] rounded cursor-pointer hover:bg-paper-800 text-[12px]" title="Browse rows (sortable, paginated)">
-          <span class="chev text-ink-700 transition-transform duration-150" style="display:inline-flex">${ic("chevron", 11)}</span>
-          <span class="${t.kind === "view" ? "text-blue-led" : "text-ink-500"}">${ic(t.kind === "view" ? "eye" : "table", 12)}</span>
-          <span class="flex-1 truncate text-ink-300">${esc(label)}</span>
-          <span class="font-mono text-[9.5px] text-ink-700">${Number(t.est_rows) >= 0 ? "~" + t.est_rows : ""}</span>
-        </div>
-        <div class="cols hidden ml-6 py-0.5 font-mono text-[10.5px] leading-[1.7] text-ink-500">${cols.map(c =>
-          `<div class="truncate">${pk.includes(c.name) ? `<span class="text-amber-led">${ic("keyround", 9)}</span>` : "<span class='inline-block w-[9px]'></span>"} ${esc(c.name)} <span class="text-ink-700">${esc(c.type)}${c.nullable ? "" : " !"}</span></div>`).join("")}
-        </div>`;
-      const chev = node.querySelector(".chev");
-      const cd = node.querySelector(".cols");
-      chev.addEventListener("click", e => {
-        e.stopPropagation();
-        cd.classList.toggle("hidden");
-        chev.style.transform = cd.classList.contains("hidden") ? "" : "rotate(90deg)";
-      });
-      node.querySelector(".tnode").addEventListener("click", () => selectTable(t.schema, t.name));
-      el.appendChild(node);
-    }
-    if (!schema.tables.length) el.innerHTML = `<div class="mlabel py-1">no tables</div>`;
-  } catch (e) { el.innerHTML = `<div class="text-red-led text-xs py-1">${esc(e.message)}</div>`; }
-}
-function showCreateDb() { const d = document.getElementById("createdb"); d.style.display = d.style.display === "none" ? "flex" : "none"; }
-async function createDb() {
-  const name = document.getElementById("newdbname").value.trim();
-  const owner = document.getElementById("newdbowner").value.trim();
-  if (!name) return toast("Enter a database name", true);
-  try {
-    await api("/api/databases", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, owner: owner || undefined }) });
-    toast("Database " + name + " created");
-    document.getElementById("createdb").style.display = "none";
-    document.getElementById("newdbname").value = "";
-    loadDatabases();
-  } catch (e) { toast(e.message, true); }
-}
-function dropDb(name) {
-  openModal(`
-    <div class="flex items-center gap-3 px-5 py-4 border-b border-rule-700">
-      <span class="led led-red"></span>
-      <span class="font-display font-semibold italic text-[16px]">Strike from the ledger</span>
-      <span class="chip chip-red ml-auto">irreversible</span>
-    </div>
-    <div class="px-5 py-4 flex flex-col gap-3">
-      <div class="text-ink-300 text-xs"><span class="font-mono text-red-led font-bold">DROP DATABASE "${esc(name)}" WITH (FORCE)</span> — every table, row and index in it is gone for good, and open connections are severed.</div>
-      <label class="mlabel">type the database name to confirm</label>
-      <input id="dropconfirm" class="input font-mono" placeholder="${esc(name)}" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="flex items-center justify-end gap-2 px-5 py-3.5 border-t border-rule-700">
-      <button class="btn" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-danger" id="dropgo" disabled style="opacity:.45"><span data-ic="trash" data-s="13"></span>Drop database</button>
-    </div>`);
-  hydrateIcons(modalCard);
-  const inp = document.getElementById("dropconfirm"), go = document.getElementById("dropgo");
-  inp.focus();
-  inp.addEventListener("input", () => {
-    const ok = inp.value === name;
-    go.disabled = !ok; go.style.opacity = ok ? "1" : ".45";
-  });
-  inp.addEventListener("keydown", e => { if (e.key === "Enter" && !go.disabled) go.click(); });
-  go.addEventListener("click", async () => {
-    closeModal();
-    try {
-      await api("/api/databases/" + encodeURIComponent(name), { method: "DELETE" });
-      toast("Dropped " + name);
-      if (currentDb === name) { currentDb = ""; document.getElementById("curdb").textContent = "—"; }
-      loadDatabases();
-    } catch (e) { toast(e.message, true); }
-  });
-}
-
-/* ════════════════ table selection → browse + DDL tab ════════════════ */
-function fqtn(schema, name) { return (schema === "public" ? "" : '"' + schema + '".') + '"' + name + '"'; }
-function selectTable(schema, name) {
-  activeTable = { schema, name };
-  const btn = document.getElementById("tabbtn-table");
-  btn.disabled = false;
-  document.getElementById("tabbtn-table-label").textContent = name;
-  document.getElementById("tbl-title").textContent = (schema === "public" ? "" : schema + ".") + name;
-  tableDefLoadedFor = null;
-  showTab("query");
-  const meta = lookupTableMeta(schema, name);
-  if (meta) {
-    // PK known → browse mode: sortable headers + keyset pagination
-    browse = { schema, table: name, pk: meta.pk, types: meta.types, sort: null, pages: [null], page: 0, limit: 100 };
-    browseRun();
-  } else {
-    browse = null;
-    setEditorSql(`SELECT * FROM ${fqtn(schema, name)} LIMIT 100;`);
-    runQuery(true);
-  }
-}
-
-/* ════════════════ DDL & indexes inspector ════════════════ */
-let tableDefLoadedFor = null;
-async function loadTableDef(force) {
-  if (!activeTable || !currentDb) return;
-  const key = currentDb + "/" + activeTable.schema + "." + activeTable.name;
-  if (!force && tableDefLoadedFor === key) return;
-  const ddlEl = document.getElementById("tbl-ddl");
-  const idxEl = document.getElementById("tbl-indexes");
-  const statsEl = document.getElementById("tbl-stats");
-  ddlEl.textContent = "loading…"; idxEl.innerHTML = ""; statsEl.innerHTML = "";
-  try {
-    const { ddl, indexes, stats = [] } = await api(`/api/tabledef?db=${encodeURIComponent(currentDb)}&schema=${encodeURIComponent(activeTable.schema)}&table=${encodeURIComponent(activeTable.name)}`);
-    tableDefLoadedFor = key;
-    ddlEl.innerHTML = hlSql(ddl);
-    const estRows = stats.length ? Math.max(0, Number(stats[0].est_rows)) : 0;
-    const fmtDistinct = nd => {
-      if (nd === null || nd === undefined) return '<span class="text-ink-700">—</span>';
-      const n = Number(nd);
-      if (n === -1) return '<span class="chip chip-green">unique</span>';
-      if (n < 0) return `~${Math.round(-n * estRows).toLocaleString()} <span class="text-ink-700">· ${(-n * 100).toFixed(0)}% of rows</span>`;
-      return "~" + n.toLocaleString();
-    };
-    statsEl.innerHTML = stats.length
-      ? `<table class="grid-table w-full"><thead><tr><th>column</th><th>type</th><th>constraint</th><th>null %</th><th>distinct · cardinality</th><th>avg width</th></tr></thead>
-        <tbody>${stats.map(c => `<tr>
-          <td class="text-ink-100">${esc(c.name)}</td>
-          <td>${esc(c.type)}</td>
-          <td>${c.nullable ? "" : '<span class="chip chip-amber">not null</span>'}</td>
-          <td>${c.null_frac == null ? '<span class="text-ink-700">—</span>' : (Number(c.null_frac) * 100).toFixed(1) + "%"}</td>
-          <td>${fmtDistinct(c.n_distinct)}</td>
-          <td>${c.avg_width == null ? '<span class="text-ink-700">—</span>' : c.avg_width + " B"}</td>
-        </tr>`).join("")}</tbody></table>` + (stats.every(c => c.n_distinct == null)
-          ? `<div class="mlabel mt-2">no statistics yet — run <span class="text-quill-400">ANALYZE ${esc(activeTable.name)}</span> in the console</div>`
-          : `<div class="mlabel mt-2">≈ ${estRows.toLocaleString()} rows (planner estimate)</div>`)
-      : `<div class="mlabel py-2">—</div>`;
-    idxEl.innerHTML = indexes.length
-      ? `<table class="grid-table w-full"><thead><tr><th>index</th><th>type</th><th>size</th><th>scans</th><th>definition</th></tr></thead>
-        <tbody>${indexes.map(x => `<tr>
-          <td class="text-ink-100">${esc(x.name)}</td>
-          <td>${x.is_primary ? '<span class="chip chip-amber">primary</span>' : x.is_unique ? '<span class="chip chip-quill">unique</span>' : '<span class="chip">btree</span>'}</td>
-          <td>${fmtBytes(x.bytes)}</td>
-          <td class="${Number(x.scans) === 0 ? "text-ink-700" : "text-green-led"}">${x.scans}</td>
-          <td class="!whitespace-normal !max-w-none font-mono text-[11px]">${esc(x.def)}</td>
-        </tr>`).join("")}</tbody></table>`
-      : `<div class="mlabel py-2">no indexes</div>`;
-  } catch (e) { ddlEl.textContent = e.message; }
-}
-function copyDdl() {
-  navigator.clipboard.writeText(document.getElementById("tbl-ddl").textContent);
-  toast("DDL copied");
-}
-
-/* ════════════════ query console ════════════════ */
-function setEditorSql(sql) { document.getElementById("sqlbox").value = sql; }
-function insertSnippet() {
-  const sel = document.getElementById("snippets");
-  if (!sel.value) return;
-  const box = document.getElementById("sqlbox");
-  box.value = (box.value ? box.value.replace(/\s*$/, "\n\n") : "") + sel.value + "\n";
-  sel.value = "";
-  box.focus();
-}
-/* PK + column types for a table, from the schema cache */
-function lookupTableMeta(schema, table) {
-  const cache = schemaCache[currentDb];
-  if (!cache) return null;
-  const pk = (cache.pks.find(p => p.schema === schema && p.table === table) || {}).cols || [];
-  if (!pk.length) return null;
-  const cols = cache.columns.filter(c => c.schema === schema && c.table === table);
-  return { schema, table, pk, types: Object.fromEntries(cols.map(c => [c.name, c.type])) };
-}
-/* if the run is a plain single-table SELECT * and we know its PK, results are editable */
-function detectEditable(sql) {
-  const m = sql.trim().match(/^select\s+\*\s+from\s+(?:"([^"]+)"\.)?"?([\w]+)"?\s*(?:limit\s+\d+)?\s*;?\s*$/i);
-  return m ? lookupTableMeta(m[1] || "public", m[2]) : null;
-}
-let lastRun = null; // { sql, results, editable }
-
-/* ════════════════ table browse: sort + keyset (cursor) pagination ════════════════
-   Interactions compile to SQL — the grid never sorts the DOM. "Next" anchors on the
-   last row of the page: WHERE (sort_col, pk…) > (cursor values), never OFFSET. */
-let browse = null; // { schema, table, pk, types, sort:{col,dir}|null, pages:[cursorRow|null], page, limit }
-function browseFq() { return (browse.schema === "public" ? "" : qid(browse.schema) + ".") + qid(browse.table); }
-function compileBrowse() {
-  const s = browse.sort;
-  const dir = s ? s.dir : "ASC";
-  const op = dir === "ASC" ? ">" : "<";
-  const orderCols = s ? [s.col, ...browse.pk.filter(k => k !== s.col)] : [...browse.pk];
-  const order = orderCols.map(c => `${qid(c)} ${dir}${s && c === s.col ? " NULLS LAST" : ""}`).join(", ");
-  let where = "";
-  const cur = browse.pages[browse.page]; // last row of the previous page, or null on page 1
-  if (cur) {
-    const pkTuple = browse.pk.length === 1 ? qid(browse.pk[0]) : `(${browse.pk.map(qid).join(", ")})`;
-    const pkVals = browse.pk.length === 1 ? sqlLit(cur[browse.pk[0]], browse.types[browse.pk[0]] || "")
-      : `(${browse.pk.map(k => sqlLit(cur[k], browse.types[k] || "")).join(", ")})`;
-    if (!s) where = `WHERE ${pkTuple} ${op} ${pkVals}`;
-    else {
-      const c = qid(s.col), v = cur[s.col];
-      if (v === null || v === undefined) where = `WHERE ${c} IS NULL AND ${pkTuple} ${op} ${pkVals}`;
-      else {
-        const lit = sqlLit(v, browse.types[s.col] || "");
-        where = `WHERE (${c} ${op} ${lit} OR (${c} = ${lit} AND ${pkTuple} ${op} ${pkVals}) OR ${c} IS NULL)`;
-      }
-    }
-  }
-  return `SELECT * FROM ${browseFq()}\n${where ? where + "\n" : ""}ORDER BY ${order}\nLIMIT ${browse.limit};`;
-}
-function browseRun() {
-  const lim = Number(document.getElementById("maxrows").value) || 100;
-  if (lim !== browse.limit && browse.page > 0) { browse.pages = [null]; browse.page = 0; } // page size changed → cursors stale, restart at row 1
-  browse.limit = lim;
-  setEditorSql(compileBrowse());
-  runQuery(true, lookupTableMeta(browse.schema, browse.table));
-}
-function browseSort(col) {
-  if (!browse) return;
-  browse.sort = !browse.sort || browse.sort.col !== col ? { col, dir: "ASC" }
-    : browse.sort.dir === "ASC" ? { col, dir: "DESC" } : null;
-  browse.pages = [null]; browse.page = 0;
-  browseRun();
-}
-function browseNext() {
-  const r = lastRun?.results[0];
-  if (!browse || !r?.rows.length) return;
-  browse.pages[browse.page + 1] = r.rows[r.rows.length - 1];
-  browse.page++;
-  browseRun();
-}
-function browsePrev() { if (browse && browse.page > 0) { browse.page--; browseRun(); } }
-
-async function runQuery(skipConfirm = false, editableOverride = null) {
-  if (!currentDb) return toast("Select a database in the sidebar first", true);
-  const sql = document.getElementById("sqlbox").value.trim();
-  if (!sql) return;
-  hideAc();
-  if (!skipConfirm) {
-    const warns = classifyDanger(sql);
-    if (warns.length && !(await confirmDanger(warns, sql))) return;
-  }
-  if (!editableOverride) browse = null; // hand-run SQL leaves browse mode
-  pending.clear(); renderSaveBar();
-  const out = document.getElementById("results");
-  const sumEl = document.getElementById("runsummary");
-  sumEl.innerHTML = `<span class="chip"><span class="led led-amber"></span>running on ${esc(currentDb)}…</span>`;
-  out.innerHTML = "";
-  const t0 = performance.now();
-  try {
-    const { results } = await api("/api/query", {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ db: currentDb, sql, maxRows: Number(document.getElementById("maxrows").value) || 100 }),
-    });
-    const wall = Math.round(performance.now() - t0);
-    const dbMs = results.reduce((a, r) => a + (r.ms || 0), 0);
-    const okAll = results.every(r => r.ok);
-    const totalRows = results.reduce((a, r) => a + (r.ok ? r.rowCount : 0), 0);
-    sumEl.innerHTML = `
-      <span class="chip ${okAll ? "chip-green" : "chip-red"}"><span class="led ${okAll ? "led-green" : "led-red"}"></span>${results.length} statement${results.length === 1 ? "" : "s"}</span>
-      <span class="chip" title="time inside PostgreSQL">${ic("zap", 10)} db ${dbMs} ms</span>
-      <span class="chip" title="network round-trip + transfer (server adds ~1 ms) — this is your link to the box, not query cost">${ic("clock", 10)} wire ${Math.max(0, wall - dbMs)} ms</span>
-      <span class="chip">${totalRows} rows</span>`;
-    recordHistory({ db: currentDb, sql, ms: dbMs, ok: okAll, rows: totalRows, at: Date.now() });
-    lastRun = { sql, results, editable: results.length === 1 && results[0].ok ? (editableOverride || detectEditable(sql)) : null };
-    out.innerHTML = "";
-    results.forEach((r, si) => {
-      const block = document.createElement("div");
-      block.className = "panel overflow-clip border-l-2 " + (r.ok ? "!border-l-quill-600" : "!border-l-red-led");
-      if (!r.ok) {
-        block.innerHTML = `
-          <div class="flex items-center gap-3 px-3 py-2 bg-paper-800 font-mono text-[11px]">
-            <span class="text-red-led font-semibold">✕ ERROR</span><span class="text-ink-500 truncate">${esc(r.statement)}</span>
-            <span class="ml-auto text-ink-700">${r.ms} ms</span>
-          </div>
-          <div class="px-3 py-2.5 text-red-led font-mono text-xs">${esc(r.error)}</div>`;
-      } else if (r.rows.length) {
-        const sortable = browse && lastRun.editable && si === 0;
-        let pager = "";
-        if (sortable) {
-          // row-range pager: each Next compiles the keyset query for the following window
-          const start = browse.page * browse.limit + 1;
-          const end = start + r.rows.length - 1;
-          const atEnd = r.rows.length < browse.limit;
-          pager = `
-            <span class="flex items-center gap-1.5 mx-1">
-              <button class="btn btn-sm" data-pg="prev" title="rows ${Math.max(1, start - browse.limit)}–${start - 1}" ${browse.page === 0 ? 'disabled style="opacity:.4"' : ""}>◂ ${start - browse.limit > 0 ? `${start - browse.limit}–${start - 1}` : "Prev"}</button>
-              <span class="chip chip-quill">rows ${start}–${end}${atEnd ? " · end" : ""}</span>
-              <button class="btn btn-sm" data-pg="next" title="rows ${end + 1}–${end + browse.limit}" ${atEnd ? 'disabled style="opacity:.4"' : ""}>${end + 1}–${end + browse.limit} ▸</button>
-            </span>`;
-        }
-        block.innerHTML = `
-          <div class="flex items-center gap-3 px-3 py-1.5 bg-paper-800 font-mono text-[11px] flex-wrap">
-            <span class="text-quill-400 font-semibold">${esc(r.command || "OK")}</span>
-            <span class="text-ink-500">${r.rowCount} row${r.rowCount === 1 ? "" : "s"}${r.truncated ? ` · <span class="text-amber-led">first ${r.rows.length} shown</span>` : ""}</span>
-            ${sortable && browse.sort ? `<span class="chip chip-quill">${esc(browse.sort.col)} ${browse.sort.dir === "ASC" ? "▲" : "▼"}</span>` : ""}
-            <span class="ml-auto flex items-center gap-1.5">
-              ${pager}
-              <button class="btn btn-sm" data-exp="sql" data-si="${si}" title="Download as INSERT statements">${ic("download", 11)}sql</button>
-              <button class="btn btn-sm" data-exp="json" data-si="${si}" title="Download rows as JSON">${ic("download", 11)}json</button>
-              <span class="text-ink-700">${r.ms} ms</span>
-            </span>
-          </div>
-          <div class="gridscroll max-h-[360px]"><table class="grid-table"><thead><tr>${r.columns.map(c => sortable
-            ? `<th class="thsort" data-col="${esc(c)}" title="Sort by ${esc(c)}">${esc(c)}${browse.sort?.col === c ? (browse.sort.dir === "ASC" ? " ▲" : " ▼") : ""}</th>`
-            : `<th>${esc(c)}</th>`).join("")}</tr></thead>
-          <tbody>${r.rows.map((row, ri) => `<tr>${r.columns.map(c => {
-            const v = row[c];
-            const text = v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
-            return `<td class="cellv" data-si="${si}" data-ri="${ri}" data-c="${esc(c)}" title="${esc(text.slice(0, 400))}">${v === null ? '<span class="text-ink-700">∅</span>' : esc(text)}</td>`;
-          }).join("")}</tr>`).join("")}</tbody></table></div>`;
-      } else {
-        block.innerHTML = `
-          <div class="flex items-center gap-3 px-3 py-2 bg-paper-800 font-mono text-[11px]">
-            <span class="text-quill-400 font-semibold">${esc(r.command || "OK")}</span>
-            <span class="text-ink-500">${r.rowCount} row${r.rowCount === 1 ? "" : "s"} affected</span>
-            <span class="text-ink-700 truncate">${esc(r.statement)}</span>
-            <span class="ml-auto text-ink-700">${r.ms} ms</span>
-          </div>`;
-      }
-      out.appendChild(block);
-    });
-    const failed = results.some(r => !r.ok);
-    if (/\b(create|drop|alter)\b/i.test(sql) && !failed) { loadTree(currentDb); loadDatabases(); tableDefLoadedFor = null; }
-  } catch (e) {
-    sumEl.innerHTML = `<span class="chip chip-red"><span class="led led-red"></span>failed</span>`;
-    out.innerHTML = `<div class="text-red-led font-mono text-xs">${esc(e.message)}</div>`;
-  }
-}
-
-/* ════════════════ cell inspector / inline editor / export ════════════════ */
-let cellClickTimer = null;
-document.getElementById("results").addEventListener("click", e => {
-  const pg = e.target.closest("[data-pg]");
-  if (pg) { if (!pg.disabled) pg.dataset.pg === "next" ? browseNext() : browsePrev(); return; }
-  const ex = e.target.closest("[data-exp]");
-  if (ex) return exportResult(Number(ex.dataset.si), ex.dataset.exp);
-  const th = e.target.closest("th.thsort");
-  if (th) return browseSort(th.dataset.col);
-  const td = e.target.closest("td.cellv");
-  if (!td || td.querySelector("input")) return;
-  const open = () => openCellModal(Number(td.dataset.si), Number(td.dataset.ri), td.dataset.c);
-  if (lastRun?.editable) { // wait: a double-click means inline edit, not the inspector
-    clearTimeout(cellClickTimer);
-    cellClickTimer = setTimeout(open, 260);
-  } else open();
-});
-document.getElementById("results").addEventListener("dblclick", e => {
-  const td = e.target.closest("td.cellv");
-  if (!td || !lastRun?.editable || td.querySelector("input")) return;
-  clearTimeout(cellClickTimer);
-  startInlineEdit(td);
-});
-
-/* inline editing — edits accumulate as "pending", saved as one transaction */
-const pending = new Map(); // "ri:col" -> {ri, col, text}
-const cellText = v => v === null || v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
-function startInlineEdit(td) {
-  const si = Number(td.dataset.si), ri = Number(td.dataset.ri), col = td.dataset.c;
-  const ed = lastRun.editable;
-  if (ed.pk.includes(col)) return toast("Primary-key cells anchor the UPDATE — not editable", true);
-  const orig = lastRun.results[si].rows[ri][col];
-  const prev = pending.get(ri + ":" + col);
-  td.innerHTML = `<input class="cellinput" spellcheck="false">`;
-  const inp = td.querySelector("input");
-  inp.value = prev ? prev.text : cellText(orig);
-  inp.focus(); inp.select();
-  let done = false;
-  const finish = commit => {
-    if (done) return; done = true;
-    if (commit) {
-      if (inp.value !== cellText(orig)) pending.set(ri + ":" + col, { ri, col, text: inp.value });
-      else pending.delete(ri + ":" + col);
-    }
-    paintCell(td, si, ri, col);
-    renderSaveBar();
-  };
-  inp.addEventListener("keydown", ev => {
-    if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
-    else if (ev.key === "Escape") { ev.stopPropagation(); finish(false); }
-  });
-  inp.addEventListener("blur", () => finish(true));
-}
-function paintCell(td, si, ri, col) {
-  const p = pending.get(ri + ":" + col);
-  if (p) {
-    td.classList.add("pendingcell");
-    td.textContent = p.text === "" ? "''" : p.text;
-    td.title = "pending: " + p.text;
-  } else {
-    td.classList.remove("pendingcell");
-    const orig = lastRun.results[si].rows[ri][col];
-    if (orig === null) { td.innerHTML = '<span class="text-ink-700">∅</span>'; td.title = ""; }
-    else { td.textContent = cellText(orig); td.title = cellText(orig).slice(0, 400); }
-  }
-}
-function renderSaveBar() {
-  const bar = document.getElementById("savebar");
-  bar.style.display = pending.size ? "flex" : "none";
-  if (pending.size) {
-    const rows = new Set([...pending.values()].map(p => p.ri)).size;
-    document.getElementById("savecount").textContent = `${pending.size} pending edit${pending.size > 1 ? "s" : ""} · ${rows} row${rows > 1 ? "s" : ""}`;
-  }
-}
-function discardPending() {
-  pending.clear();
-  document.querySelectorAll("#results td.pendingcell").forEach(td => paintCell(td, Number(td.dataset.si), Number(td.dataset.ri), td.dataset.c));
-  renderSaveBar();
-}
-async function savePending() {
-  if (!pending.size || !lastRun?.editable) return;
-  const ed = lastRun.editable;
-  const fq = (ed.schema === "public" ? "" : qid(ed.schema) + ".") + qid(ed.table);
-  const byRow = {};
-  for (const p of pending.values()) (byRow[p.ri] ||= []).push(p);
-  const stmts = Object.entries(byRow).map(([ri, cols]) => {
-    const row = lastRun.results[0].rows[ri];
-    const sets = cols.map(p => `${qid(p.col)} = ${textToLit(p.text, ed.types[p.col] || "")}`).join(", ");
-    const where = ed.pk.map(k => `${qid(k)} = ${sqlLit(row[k], ed.types[k] || "")}`).join(" AND ");
-    return `UPDATE ${fq} SET ${sets} WHERE ${where};`;
-  });
-  const sql = ["BEGIN;", ...stmts, "COMMIT;"].join("\n");
-  if (!(await confirmDanger(classifyDanger(sql), sql))) return;
-  try {
-    const { results } = await api("/api/query", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ db: currentDb, sql }) });
-    const bad = results.find(x => !x.ok);
-    if (bad) return toast(bad.error, true); // server already rolled back
-    toast(`Posted ${pending.size} edit${pending.size > 1 ? "s" : ""} across ${stmts.length} row${stmts.length > 1 ? "s" : ""}`);
-    pending.clear(); renderSaveBar();
-    refreshCurrent();
-  } catch (e) { toast(e.message, true); }
-}
-function textToLit(text, type) {
-  if (/json/.test(type.toLowerCase())) { try { return sqlLit(JSON.parse(text), type); } catch { /* treat as text */ } }
-  return sqlLit(text, type);
-}
-/* re-run whatever produced the current grid */
-function refreshCurrent() {
-  if (browse) browseRun();
-  else if (lastRun) { setEditorSql(lastRun.sql); runQuery(true, lastRun.editable); }
-}
-
-/* export the rows of one result as .sql INSERTs or .json */
-function exportResult(si, fmt) {
-  const r = lastRun?.results[si];
-  if (!r?.rows.length) return;
-  const rawName = lastRun.editable ? (lastRun.editable.schema === "public" ? "" : lastRun.editable.schema + ".") + lastRun.editable.table
-    : (r.statement.match(/from\s+([\w".]+)/i)?.[1] || "table_name").replace(/"/g, "");
-  let content, mime, ext;
-  if (fmt === "json") {
-    content = JSON.stringify(r.rows, null, 2);
-    mime = "application/json"; ext = "json";
-  } else {
-    const types = lastRun.editable?.types || {};
-    const fq = rawName.split(".").map(qid).join(".");
-    const colList = r.columns.map(qid).join(", ");
-    content = r.rows.map(row =>
-      `INSERT INTO ${fq} (${colList}) VALUES (${r.columns.map(c => sqlLit(row[c], types[c] || "")).join(", ")});`
-    ).join("\n") + "\n";
-    mime = "application/sql"; ext = "sql";
-  }
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([content], { type: mime }));
-  a.download = `${currentDb}-${rawName.replace(/\./g, "_")}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.${ext}`;
-  a.click();
-  URL.revokeObjectURL(a.href);
-  toast(`Exported ${r.rows.length} row${r.rows.length > 1 ? "s" : ""} as .${ext}${r.truncated ? " (fetched rows only)" : ""}`);
-}
-function openCellModal(si, ri, col) {
-  if (!lastRun) return;
-  const r = lastRun.results[si]; if (!r || !r.ok) return;
-  const row = r.rows[ri]; if (!row) return;
-  const v = row[col];
-  const isObj = v !== null && typeof v === "object";
-  const text = v === null ? "" : isObj ? JSON.stringify(v, null, 2) : String(v);
-  const ed = lastRun.editable;
-  const isPkCol = !!ed && ed.pk.includes(col);
-  const canEdit = !!ed && !isPkCol && ed.pk.every(k => r.columns.includes(k));
-  const type = ed ? ed.types[col] || "" : "";
-  openModal(`
-    <div class="flex items-center gap-2.5 px-5 py-4 border-b border-rule-700 min-w-0">
-      <span class="text-quill-400" data-ic="table" data-s="15"></span>
-      <span class="font-mono text-[13px] font-bold truncate">${ed ? esc(ed.table) + "." : ""}${esc(col)}</span>
-      ${type ? `<span class="chip">${esc(type)}</span>` : ""}
-      ${v === null ? '<span class="chip chip-amber">null</span>' : ""}
-      ${isPkCol ? '<span class="chip chip-quill">primary key</span>' : ""}
-      <span class="mlabel ml-auto flex-none">row ${ri + 1}</span>
-      <button class="btn btn-sm btn-icon" onclick="closeModal()" title="Close"><span data-ic="x" data-s="13"></span></button>
-    </div>
-    <div class="px-5 py-4 flex flex-col gap-3 overflow-y-auto min-h-0">
-      <pre class="sqlblock max-h-[38vh] overflow-y-auto" id="cellval">${v === null ? '<span class="cmt">NULL</span>' : escPre(text)}</pre>
-      <div class="flex gap-2">
-        <button class="btn btn-sm" onclick='navigator.clipboard.writeText(document.getElementById("cellval").textContent); toast("Value copied")'><span data-ic="copy" data-s="12"></span>Copy value</button>
-        <button class="btn btn-sm" id="copyrowbtn"><span data-ic="copy" data-s="12"></span>Copy row JSON</button>
-      </div>
-      ${canEdit ? `
-      <div class="h-px bg-rule-700"></div>
-      <div class="mlabel">amend entry</div>
-      <textarea id="celledit" class="input w-full font-mono text-[12px] min-h-20 resize-y" spellcheck="false">${esc(isObj ? JSON.stringify(v) : v === null ? "" : String(v))}</textarea>
-      <label class="text-xs text-ink-500 flex items-center gap-1.5"><input type="checkbox" id="cellnull" class="accent-quill-500" ${v === null ? "checked" : ""}> set NULL</label>
-      <div class="mlabel">generated update</div>
-      <pre class="sqlblock" id="cellsql"></pre>
-      <div class="flex justify-end gap-2">
-        <button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" id="cellsave"><span data-ic="play" data-s="13"></span>Run UPDATE</button>
-      </div>` : ed
-        ? `<div class="text-xs text-ink-500">${isPkCol ? "Primary-key cells aren't editable here — they anchor the UPDATE." : "Editing needs every PK column in the result."}</div>`
-        : `<div class="text-xs text-ink-500">Read-only: editing needs a plain <span class="font-mono">SELECT * FROM table</span> on a table with a primary key.</div>`}
-    </div>`);
-  hydrateIcons(modalCard);
-  document.getElementById("copyrowbtn").addEventListener("click", () => { navigator.clipboard.writeText(JSON.stringify(row, null, 2)); toast("Row copied as JSON"); });
-  if (canEdit) {
-    const q = s => '"' + s.replace(/"/g, '""') + '"';
-    const fq = (ed.schema === "public" ? "" : q(ed.schema) + ".") + q(ed.table);
-    const where = ed.pk.map(k => `${q(k)} = ${sqlLit(row[k], ed.types[k] || "")}`).join(" AND ");
-    const editEl = document.getElementById("celledit"), nullEl = document.getElementById("cellnull"), sqlEl = document.getElementById("cellsql");
-    const buildUpdate = () => {
-      let nv = nullEl.checked ? null : editEl.value;
-      if (nv !== null && /json/.test(type.toLowerCase())) { try { nv = JSON.parse(nv); } catch { /* keep as text */ } }
-      return `UPDATE ${fq} SET ${q(col)} = ${sqlLit(nv, type)} WHERE ${where};`;
-    };
-    const renderPrev = () => { sqlEl.innerHTML = hlSql(buildUpdate()); };
-    editEl.addEventListener("input", () => { nullEl.checked = false; renderPrev(); });
-    nullEl.addEventListener("input", renderPrev);
-    renderPrev();
-    document.getElementById("cellsave").addEventListener("click", async () => {
-      const upd = buildUpdate();
-      try {
-        const { results } = await api("/api/query", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ db: currentDb, sql: upd }) });
-        if (!results[0].ok) return toast(results[0].error, true);
-        toast(`Updated ${results[0].rowCount} row${results[0].rowCount === 1 ? "" : "s"}`);
-        closeModal();
-        refreshCurrent();
-      } catch (e2) { toast(e2.message, true); }
-    });
-  }
-}
-/* the console column must never pan horizontally — wide grids scroll inside their own wrappers */
-const consolecol = document.getElementById("consolecol");
-consolecol.addEventListener("scroll", () => { if (consolecol.scrollLeft) consolecol.scrollLeft = 0; });
-
-/* ════════════════ query history (localStorage) ════════════════ */
-const HIST_KEY = "pgal_history", HIST_MAX = 100;
-const getHist = () => { try { return JSON.parse(localStorage.getItem(HIST_KEY)) || []; } catch { return []; } };
-function recordHistory(entry) {
-  const h = getHist();
-  h.unshift(entry);
-  localStorage.setItem(HIST_KEY, JSON.stringify(h.slice(0, HIST_MAX)));
-  renderHistory();
-}
-function clearHistory() { localStorage.removeItem(HIST_KEY); renderHistory(); }
-function toggleHistory() {
-  const d = document.getElementById("histdrawer");
-  const open = d.classList.toggle("hidden");
-  d.classList.toggle("flex", !d.classList.contains("hidden"));
-  localStorage.setItem("pgal_histopen", d.classList.contains("hidden") ? "" : "1");
-  renderHistory();
-}
-function renderHistory() {
-  const el = document.getElementById("histlist");
-  if (!el || document.getElementById("histdrawer").classList.contains("hidden")) return;
-  const h = getHist();
-  el.innerHTML = h.length ? "" : `<div class="mlabel p-2">empty — run something</div>`;
-  h.forEach((e2, i) => {
-    const d = document.createElement("div");
-    d.className = "panel !bg-paper-850 p-2 cursor-pointer hover:!border-rule-300 transition-colors";
-    d.innerHTML = `
-      <div class="flex items-center gap-1.5 mb-1">
-        <span class="led ${e2.ok ? "led-green" : "led-red"}" style="width:5px;height:5px"></span>
-        <span class="font-mono text-[9.5px] text-quill-400">${esc(e2.db)}</span>
-        <span class="font-mono text-[9.5px] text-ink-700 ml-auto">${e2.ms}ms · ${e2.rows}r · ${ago(e2.at)}</span>
-      </div>
-      <div class="clamp2 font-mono text-[10.5px] text-ink-300 leading-snug">${esc(e2.sql)}</div>`;
-    d.title = e2.sql;
-    d.addEventListener("click", () => {
-      setEditorSql(e2.sql);
-      if (e2.db !== currentDb && databases.some(x => x.name === e2.db)) selectDb(e2.db);
-      document.getElementById("sqlbox").focus();
-    });
-    el.appendChild(d);
-  });
-}
-
-/* ════════════════ autocomplete ════════════════ */
-let acItems = [], acSel = 0;
-const sqlbox = document.getElementById("sqlbox");
-const acdrop = document.getElementById("acdrop");
-const acmirror = document.getElementById("acmirror");
-
-function caretXY() {
-  // mirror-div technique: replicate text up to the caret, measure a marker span
-  const cs = getComputedStyle(sqlbox);
-  ["fontFamily","fontSize","lineHeight","padding","border","boxSizing","letterSpacing"].forEach(p => acmirror.style[p] = cs[p]);
-  acmirror.style.width = sqlbox.clientWidth + "px";
-  const upto = sqlbox.value.slice(0, sqlbox.selectionStart);
-  acmirror.innerHTML = escPre(upto).replace(/\n/g, "<br>") + '<span id="acmark">​</span>';
-  const mark = document.getElementById("acmark");
-  return { left: mark.offsetLeft, top: mark.offsetTop - sqlbox.scrollTop + 22 };
-}
-function currentToken() {
-  const upto = sqlbox.value.slice(0, sqlbox.selectionStart);
-  const m = upto.match(/[\w_]+$/);
-  return m ? m[0] : "";
-}
-function buildCandidates(tok) {
-  const lo = tok.toLowerCase();
-  const out = [];
-  for (const k of SQL_KEYWORDS) if (k.toLowerCase().startsWith(lo)) out.push({ t: k, kind: "keyword" });
-  const s = schemaCache[currentDb];
-  if (s) {
-    for (const t of s.tables) if (t.name.toLowerCase().startsWith(lo)) out.push({ t: t.name, kind: t.kind });
-    const seen = new Set();
-    for (const c of s.columns) if (c.name.toLowerCase().startsWith(lo) && !seen.has(c.name)) { seen.add(c.name); out.push({ t: c.name, kind: "col · " + c.table }); }
-  }
-  // full statements from history that continue what's typed on this line
-  const upto = sqlbox.value.slice(0, sqlbox.selectionStart);
-  const line = upto.slice(upto.lastIndexOf("\n") + 1).replace(/^\s+/, "");
-  if (line.length >= 3) {
-    const seenH = new Set();
-    for (const h of getHist()) {
-      const one = h.sql.trim();
-      if (one.toLowerCase().startsWith(line.toLowerCase()) && one.length > line.length && !seenH.has(one)) {
-        seenH.add(one);
-        out.unshift({ t: one, kind: "history · " + h.db, line });
-        if (seenH.size >= 3) break;
-      }
-    }
-  }
-  // exact match alone isn't a suggestion
-  return out.filter(x => x.t.toLowerCase() !== lo).slice(0, 12);
-}
-function showAc() {
-  const tok = currentToken();
-  if (tok.length < 2) return hideAc();
-  acItems = buildCandidates(tok);
-  if (!acItems.length) return hideAc();
-  acSel = 0;
-  const { left, top } = caretXY();
-  acdrop.style.left = Math.min(left, sqlbox.clientWidth - 220) + "px";
-  acdrop.style.top = top + "px";
-  acdrop.classList.remove("hidden");
-  renderAc();
-}
-function renderAc() {
-  acdrop.innerHTML = acItems.map((x, i) =>
-    `<div class="ac-item ${i === acSel ? "sel" : ""}" data-i="${i}"><span class="ac-text">${esc(x.t)}</span><span class="ac-kind">${esc(x.kind)}</span></div>`).join("");
-  acdrop.querySelectorAll(".ac-item").forEach(d => d.addEventListener("mousedown", e => { e.preventDefault(); acSel = Number(d.dataset.i); acceptAc(); }));
-}
-function hideAc() { acdrop.classList.add("hidden"); acItems = []; }
-function acceptAc() {
-  if (!acItems.length) return;
-  const item = acItems[acSel];
-  const pos = sqlbox.selectionStart;
-  if (item.line !== undefined) {
-    // history item: replace the whole current line (keeping its indentation)
-    const lineStart = sqlbox.value.lastIndexOf("\n", pos - 1) + 1;
-    const indent = (sqlbox.value.slice(lineStart, pos).match(/^\s*/) || [""])[0];
-    const start = lineStart + indent.length;
-    sqlbox.value = sqlbox.value.slice(0, start) + item.t + sqlbox.value.slice(pos);
-    sqlbox.selectionStart = sqlbox.selectionEnd = start + item.t.length;
-  } else {
-    const tok = currentToken();
-    sqlbox.value = sqlbox.value.slice(0, pos - tok.length) + item.t + sqlbox.value.slice(pos);
-    sqlbox.selectionStart = sqlbox.selectionEnd = pos - tok.length + item.t.length;
-  }
-  hideAc();
-  sqlbox.focus();
-}
-sqlbox.addEventListener("input", showAc);
-sqlbox.addEventListener("blur", () => setTimeout(hideAc, 150));
-sqlbox.addEventListener("keydown", e => {
-  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runQuery(); return; }
-  if (acdrop.classList.contains("hidden")) return;
-  if (e.key === "ArrowDown") { e.preventDefault(); acSel = (acSel + 1) % acItems.length; renderAc(); }
-  else if (e.key === "ArrowUp") { e.preventDefault(); acSel = (acSel - 1 + acItems.length) % acItems.length; renderAc(); }
-  else if (e.key === "Tab" || e.key === "Enter") { e.preventDefault(); acceptAc(); }
-  else if (e.key === "Escape") hideAc();
-});
-
-/* ════════════════ create table builder ════════════════ */
-const PG_TYPES = ["BIGSERIAL","SERIAL","BIGINT","INTEGER","SMALLINT","NUMERIC(12,2)","DOUBLE PRECISION","TEXT","VARCHAR(255)","BOOLEAN","DATE","TIMESTAMPTZ","TIMESTAMP","TIME","UUID","JSONB","BYTEA"];
-function addColRow(name = "", type = "TEXT") {
-  const div = document.createElement("div");
-  div.className = "grid items-center gap-1.5";
-  div.style.gridTemplateColumns = "1.2fr 1.2fr 0.5fr 1fr 0.4fr 0.3fr";
-  div.dataset.coldef = "1";
-  div.innerHTML = `
-    <input class="input font-mono text-xs py-1.5" placeholder="column_name" value="${esc(name)}" oninput="renderDdl()">
-    <select class="input text-xs py-1.5 font-mono" oninput="renderDdl()">${PG_TYPES.map(t => `<option ${t === type ? "selected" : ""}>${t}</option>`).join("")}</select>
-    <label class="text-[11px] text-ink-500 flex items-center gap-1 justify-center"><input type="checkbox" checked class="accent-quill-500" oninput="renderDdl()">null</label>
-    <input class="input font-mono text-xs py-1.5" placeholder="default (raw SQL)" oninput="renderDdl()">
-    <label class="text-[11px] text-ink-500 flex items-center gap-1 justify-center"><input type="checkbox" class="accent-amber-led" oninput="renderDdl()">pk</label>
-    <button class="btn btn-sm btn-icon btn-danger justify-self-center" onclick="this.parentElement.remove(); renderDdl()">${ic("x", 11)}</button>`;
-  document.getElementById("ct-cols").appendChild(div);
-  renderDdl();
-}
-function buildDdl() {
-  const schema = document.getElementById("ct-schema").value.trim() || "public";
-  const name = document.getElementById("ct-name").value.trim();
-  if (!name) return null;
-  const q = s => '"' + s.replace(/"/g, '""') + '"';
-  const lines = [], pks = [];
-  for (const row of document.querySelectorAll("[data-coldef]")) {
-    const inputs = row.querySelectorAll("input"); // [name, nullable, default, pk] in DOM order
-    const colName = inputs[0].value.trim();
-    const type = row.querySelector("select").value;
-    const nullable = inputs[1].checked;
-    const dflt = inputs[2].value.trim();
-    const pk = inputs[3].checked;
-    if (!colName) continue;
-    let l = `  ${q(colName)} ${type}`;
-    if (!nullable) l += " NOT NULL";
-    if (dflt) l += ` DEFAULT ${dflt}`;
-    lines.push(l);
-    if (pk) pks.push(q(colName));
-  }
-  if (!lines.length) return null;
-  if (pks.length) lines.push(`  PRIMARY KEY (${pks.join(", ")})`);
-  const fq = (schema === "public" ? "" : q(schema) + ".") + q(name);
-  return `CREATE TABLE ${fq} (\n${lines.join(",\n")}\n);`;
-}
-function renderDdl() {
-  const ddl = buildDdl();
-  document.getElementById("ct-ddl").innerHTML = ddl ? hlSql(ddl) : '<span class="cmt">-- add a table name and at least one column</span>';
-}
-async function execDdl() {
-  const ddl = buildDdl();
-  if (!ddl) return toast("Add a table name and at least one column", true);
-  if (!currentDb) return toast("Select a database first", true);
-  try {
-    const { results } = await api("/api/query", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ db: currentDb, sql: ddl }) });
-    if (results[0].ok) { toast("Table created in " + currentDb); loadTree(currentDb); }
-    else toast(results[0].error, true);
-  } catch (e) { toast(e.message, true); }
-}
-function ddlToEditor() { const ddl = buildDdl(); if (ddl) { setEditorSql(ddl); showTab("query"); } }
-
-/* ════════════════ joins ════════════════ */
-function tableOptions(db) {
-  const s = schemaCache[db];
-  if (!s) return "";
-  return s.tables.filter(t => t.kind !== "view").map(t => {
-    const v = (t.schema === "public" ? "" : t.schema + ".") + t.name;
-    return `<option value="${esc(v)}">${esc(v)}</option>`;
-  }).join("");
-}
-async function fillTableSelects() {
-  if (!currentDb) return;
-  if (!schemaCache[currentDb]) { try { schemaCache[currentDb] = await api("/api/schema?db=" + encodeURIComponent(currentDb)); } catch { return; } }
-  const opts = tableOptions(currentDb);
-  document.getElementById("join-table").innerHTML = `<option value="">Pick a table…</option>` + opts;
-  document.getElementById("join-from").innerHTML = `<option value="">from…</option>` + opts;
-  document.getElementById("join-to").innerHTML = `<option value="">to…</option>` + opts;
-}
-const CONF_CHIP = { high: "chip-green", medium: "chip-amber", low: "chip" };
-/* DOM-built cards: SQL goes through closures, never through onclick attributes
-   (quotes in generated SQL used to break the inline handlers silently) */
-function createJoinCard({ title, detail, sql, kind, confidence }) {
-  const card = document.createElement("div");
-  card.className = "panel p-3.5";
-  card.innerHTML = `
-    <div class="flex items-center gap-2 mb-1">
-      <span class="font-medium text-[13px]">${esc(title)}</span>
-      <span class="chip ${CONF_CHIP[confidence] || "chip"}">${esc(kind || "path")}${confidence ? " · " + confidence : ""}</span>
-    </div>
-    <div class="text-ink-500 text-xs mb-2">${esc(detail || "")}</div>
-    <pre class="sqlblock mb-2.5">${hlSql(sql)}</pre>
-    <div class="flex gap-2">
-      <button class="btn btn-primary btn-sm" data-run>${ic("play", 11)}Run in console</button>
-      <button class="btn btn-sm" data-copy>${ic("copy", 11)}Copy</button>
-    </div>`;
-  card.querySelector("[data-run]").addEventListener("click", () => openInEditor(sql));
-  card.querySelector("[data-copy]").addEventListener("click", () => { navigator.clipboard.writeText(sql); toast("Copied"); });
-  return card;
-}
-function openInEditor(sql) { setEditorSql(sql); showTab("query"); runQuery(); }
-async function loadJoins() {
-  const t = document.getElementById("join-table").value;
-  if (!t || !currentDb) return toast("Pick a database and table", true);
-  const out = document.getElementById("join-results");
-  out.innerHTML = `<div class="mlabel">analysing relationships…</div>`;
-  try {
-    const { suggestions } = await api(`/api/joins?db=${encodeURIComponent(currentDb)}&table=${encodeURIComponent(t)}`);
-    if (suggestions.length) out.replaceChildren(...suggestions.map(createJoinCard));
-    else out.innerHTML = `<div class="mlabel">no join candidates for ${esc(t)} — no FKs, no shared columns</div>`;
-  } catch (e) { out.innerHTML = `<div class="text-red-led text-xs">${esc(e.message)}</div>`; }
-}
-async function loadJoinPath() {
-  const f = document.getElementById("join-from").value, t = document.getElementById("join-to").value;
-  if (!f || !t || !currentDb) return toast("Pick from and to tables", true);
-  const out = document.getElementById("join-results");
-  out.innerHTML = `<div class="mlabel">searching join graph…</div>`;
-  try {
-    const { path, message } = await api(`/api/joins?db=${encodeURIComponent(currentDb)}&from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`);
-    if (path) out.replaceChildren(createJoinCard({ title: `${f} → ${t}`, detail: "via " + path.via.join(" → "), sql: path.sql, kind: "path", confidence: path.via.some(v => v.startsWith("shared")) ? "low" : "high" }));
-    else out.innerHTML = `<div class="mlabel">${esc(message || "no path found")}</div>`;
-  } catch (e) { out.innerHTML = `<div class="text-red-led text-xs">${esc(e.message)}</div>`; }
-}
-
-/* ════════════════ transfer ════════════════ */
-function fillDbSelects() {
-  const opts = databases.map(d => `<option ${d.name === currentDb ? "selected" : ""}>${esc(d.name)}</option>`).join("");
-  document.getElementById("exp-db").innerHTML = opts;
-  document.getElementById("imp-db").innerHTML = opts;
-}
-function exportDb(format) {
-  const db = document.getElementById("exp-db").value;
-  if (!db) return toast("Pick a database", true);
-  const a = document.createElement("a");
-  a.href = `/api/export?db=${encodeURIComponent(db)}&format=${format}&token=${encodeURIComponent(token)}`;
-  a.download = "";
-  a.click();
-  toast(`Exporting ${db} (${format})…`);
-}
-async function importDb() {
-  const fileEl = document.getElementById("imp-file");
-  if (!fileEl.files.length) return toast("Choose a file", true);
-  const create = document.getElementById("imp-create").checked;
-  const db = create ? document.getElementById("imp-newname").value.trim() : document.getElementById("imp-db").value;
-  if (!db) return toast(create ? "Enter the new database name" : "Pick a target database", true);
-  const out = document.getElementById("imp-out");
-  out.classList.remove("hidden");
-  out.textContent = "importing…";
-  try {
-    const res = await fetch(`/api/import?db=${encodeURIComponent(db)}${create ? "&create=1" : ""}`, {
-      method: "POST", headers: { authorization: "Bearer " + token }, body: fileEl.files[0],
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Import failed");
-    out.textContent = `[${data.tool} exit ${data.exitCode}]\n` + (data.stderr || "") + (data.stdout || "");
-    toast(data.ok ? `Imported into ${db}` : `Import finished with errors (exit ${data.exitCode})`, !data.ok);
-    loadDatabases();
-  } catch (e) { out.textContent = e.message; toast(e.message, true); }
-}
-
-/* ════════════════ access ════════════════ */
-async function loadRoles() {
-  const out = document.getElementById("roles-out");
-  try {
-    const { roles } = await api("/api/roles");
-    out.innerHTML = `<table class="grid-table w-full"><thead><tr><th>role</th><th>login</th><th>superuser</th><th>createdb</th><th>createrole</th><th>conn limit</th></tr></thead>
-      <tbody>${roles.map(r => `<tr><td class="text-ink-100">${esc(r.name)}</td>
-        <td>${r.login ? '<span class="text-green-led">●</span>' : ""}</td>
-        <td>${r.superuser ? '<span class="text-amber-led">●</span>' : ""}</td>
-        <td>${r.createdb ? '<span class="text-quill-400">●</span>' : ""}</td>
-        <td>${r.createrole ? '<span class="text-quill-400">●</span>' : ""}</td>
-        <td>${r.conn_limit < 0 ? "∞" : r.conn_limit}</td></tr>`).join("")}</tbody></table>`;
-  } catch (e) { out.innerHTML = `<div class="text-red-led text-xs">${esc(e.message)}</div>`; }
-}
-async function loadGrants() {
-  document.getElementById("grants-db").textContent = currentDb || "—";
-  const out = document.getElementById("grants-out");
-  if (!currentDb) { out.innerHTML = `<div class="mlabel">select a database</div>`; return; }
-  try {
-    const { grants } = await api("/api/grants?db=" + encodeURIComponent(currentDb));
-    out.innerHTML = grants.length
-      ? `<table class="grid-table w-full"><thead><tr><th>table</th><th>grantee</th><th>privileges</th></tr></thead>
-        <tbody>${grants.map(g => `<tr><td class="text-ink-100">${esc(g.schema)}.${esc(g.table)}</td><td>${esc(g.grantee)}</td><td class="!whitespace-normal !max-w-none">${esc(g.privileges)}</td></tr>`).join("")}</tbody></table>`
-      : `<div class="mlabel">no explicit table grants</div>`;
-  } catch (e) { out.innerHTML = `<div class="text-red-led text-xs">${esc(e.message)}</div>`; }
-}
-
-/* ════════════════ init ════════════════ */
-async function init() {
-  document.getElementById("conninfo").textContent = "postgres://localhost:5432";
-  if (!document.querySelector("[data-coldef]")) addColRow("id", "BIGSERIAL");
-  if (localStorage.getItem("pgal_histopen")) { document.getElementById("histdrawer").classList.remove("hidden"); document.getElementById("histdrawer").classList.add("flex"); renderHistory(); }
-  await loadDatabases();
-}
-(async () => {
-  if (!token) return showLogin();
-  try { await api("/api/databases"); document.getElementById("login").style.display = "none"; init(); }
-  catch { /* 401 already routed to showLogin */ }
-})();
-</script>
+<script src="/js/core.js"></script>
+<script src="/js/app.js"></script>
+<script src="/js/console.js"></script>
+<script src="/js/autocomplete.js"></script>
+<script src="/js/builder.js"></script>
+<script src="/js/joins.js"></script>
+<script src="/js/transfer.js"></script>
+<script src="/js/access.js"></script>
+<script src="/js/saved.js"></script>
+<script src="/js/ai.js"></script>
+<script src="/js/boot.js"></script>
 </body>
 </html>
